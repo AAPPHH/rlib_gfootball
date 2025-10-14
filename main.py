@@ -200,7 +200,8 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
     config.framework(framework="torch")
 
     config.env_runners(
-        num_env_runners=0 if debug_mode else 22,
+        # KORREKTUR: Reduziert, damit 3 Trials auf 24 CPUs passen (3 * (6+2) = 24)
+        num_env_runners=0 if debug_mode else 6,
         num_envs_per_env_runner=2,
         gym_env_vectorize_mode="ASYNC",
         rollout_fragment_length=10 if debug_mode else 64,
@@ -239,13 +240,13 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
     )
 
     config.resources(
-        num_gpus=1,
+        num_gpus=1/3,
         num_cpus_for_main_process=1,
     )
     
     config.learners(
         num_learners=1,
-        num_gpus_per_learner=1,
+        num_gpus_per_learner=1/3,
         num_cpus_per_learner=1,
     )
     
@@ -276,8 +277,6 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
     config.debugging(seed=42, log_level="INFO")
 
     return config
-
-# --- Angepasste Haupt-Trainingsfunktion für PBT ---
 
 def train():
     debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
