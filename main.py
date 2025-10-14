@@ -22,9 +22,6 @@ from ray.tune.schedulers import PopulationBasedTraining
 
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
-    """
-    RLlib MultiAgentEnv wrapper for the Google Research Football environment.
-    """
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
@@ -161,8 +158,6 @@ class SelfPlayCallback(DefaultCallbacks):
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
         self._update_counter += 1
         if self._update_counter % self.update_interval == 0:
-            print(f"\n--- [Self-Play] Updating opponent policy with main policy weights (Iteration: {self._update_counter}) ---\n")
-            
             main_policy = algorithm.get_policy("main_policy")
             opponent_policy = algorithm.get_policy("opponent_policy")
             
@@ -175,7 +170,6 @@ class SelfPlayCallback(DefaultCallbacks):
 
 def get_self_play_policy_mapping_fn(agent_id, episode, worker, **kwargs):
     return "main_policy" if "left" in agent_id else "opponent_policy"
-
 
 def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
     config = ImpalaConfig()
@@ -200,7 +194,6 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
     config.framework(framework="torch")
 
     config.env_runners(
-        # KORREKTUR: Reduziert, damit 3 Trials auf 24 CPUs passen (3 * (6+2) = 24)
         num_env_runners=0 if debug_mode else 6,
         num_envs_per_env_runner=2,
         gym_env_vectorize_mode="ASYNC",
@@ -312,9 +305,6 @@ def train():
 
     script_path = Path(__file__).resolve().parent
     results_path = script_path / "training_results_pbt"
-    print(f"All PBT training results will be saved in: {results_path}")
-
-    resume_from_path = None
 
     stop_criteria = {
         "env_runners/episode_return_mean": 20.0,
@@ -329,13 +319,12 @@ def train():
         checkpoint_at_end=True,
     )
     
-    print("No existing experiment found. Starting a new PBT training run.")
     tuner = tune.Tuner(
         "IMPALA",
         param_space=param_space,
         tune_config=tune.TuneConfig(
             scheduler=pbt_scheduler,
-            num_samples=3,
+            num_samples=4,
         ),
         run_config=RunConfig( 
             stop=stop_criteria,
@@ -357,7 +346,6 @@ def train():
         print("Training finished. No best checkpoint was found.")
 
     ray.shutdown()
-
 
 if __name__ == "__main__":
     train()
