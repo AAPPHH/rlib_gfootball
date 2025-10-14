@@ -16,9 +16,6 @@ def run_random_agent_test():
         "write_video": False,
     }
 
-    # Die 'new_step_api=True' würde auf die neue 5-Werte-API umstellen,
-    # aber gfootball unterstützt das eventuell nicht vollständig.
-    # Wir bleiben bei der alten API und passen unseren Code an.
     env = football_env.create_environment(**env_config)
 
     num_agents = (

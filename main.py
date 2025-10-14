@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-import sys
-import json
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -16,6 +14,8 @@ from ray.rllib.algorithms.impala import ImpalaConfig
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.utils.typing import MultiAgentDict
+
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
 
@@ -56,20 +56,20 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
                          [f"right_{i}" for i in range(self.right_players)]
         self._agent_ids = set(self.agent_ids)
 
-        # === Robuste Bestimmung des Observation und Action Space ===
         reset_result = self.env.reset()
         test_obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         
-        if len(test_obs.shape) > 1:
-            # Standardfall: obs ist bereits (num_agents, num_features)
+        # Handle case where env might not have agents
+        if len(self.agent_ids) == 0:
+            single_obs_shape = test_obs.shape
+        elif len(test_obs.shape) > 1:
             single_obs_shape = test_obs[0].shape
         else:
-            # Absicherung für den Fall eines flachen 1D-Arrays
             num_features = test_obs.shape[0]
             num_agents = len(self.agent_ids)
             assert num_features % num_agents == 0, \
-                f"Größe der flachen Observation ({num_features}) ist nicht sauber " \
-                f"durch die Anzahl der Agenten ({num_agents}) teilbar."
+                f"Observation size ({num_features}) is not cleanly " \
+                f"divisible by the number of agents ({num_agents})."
             single_obs_shape = (num_features // num_agents,)
 
         single_obs_space = spaces.Box(
@@ -107,7 +107,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         
         step_result = self.env.step(actions)
         
-        # Kompatibilität für alte (gym) und neue (gymnasium) API
         if len(step_result) == 5:
             obs, rewards, terminated, truncated, info = step_result
             done = terminated or truncated
@@ -119,7 +118,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         multi_agent_rewards = self._split_rewards(rewards)
         
         multi_agent_terminateds = {agent_id: done for agent_id in self.agent_ids}
-        multi_agent_truncateds = {agent_id: truncated for agent_id in self.agent_ids} # Korrekter wäre `truncated`, aber `done` ist ok.
+        multi_agent_truncateds = {agent_id: truncated for agent_id in self.agent_ids}
         multi_agent_terminateds["__all__"] = done
         multi_agent_truncateds["__all__"] = done
         
@@ -133,16 +132,16 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
                 multi_agent_truncateds, multi_agent_infos)
 
     def _split_obs(self, obs: np.ndarray) -> MultiAgentDict:
+        if not self.agent_ids:
+             return {}
         if len(obs.shape) == 1:
             obs_per_agent = obs.shape[0] // len(self.agent_ids)
             obs = obs.reshape(len(self.agent_ids), obs_per_agent)
         
         return {self.agent_ids[i]: obs[i].astype(np.float32) for i in range(len(self.agent_ids))}
 
-    def _split_rewards(self, rewards: np.ndarray) -> MultiAgentDict:
-        # Dieser Code ist korrekt. GFootball gibt ein NumPy Array zurück,
-        # wodurch der zweite return-Pfad genutzt wird.
-        if isinstance(rewards, (int, float)):
+    def _split_rewards(self, rewards) -> MultiAgentDict:
+        if np.isscalar(rewards):
             return {agent_id: float(rewards) for agent_id in self.agent_ids}
         
         return {self.agent_ids[i]: float(rewards[i]) for i in range(len(self.agent_ids))}
@@ -153,14 +152,29 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
     def close(self):
         self.env.close()
 
+class SelfPlayCallback(DefaultCallbacks):
+    def __init__(self, update_interval: int = 25):
+        super().__init__()
+        self.update_interval = update_interval
+        self._update_counter = 0
 
-def get_policy_mapping_fn(agent_id, episode, worker, **kwargs):
-    """ Mappt Agenten zum linken oder rechten Team. """
-    return "left_team" if "left" in agent_id else "right_team"
+    def on_train_result(self, *, algorithm, result: dict, **kwargs):
+        self._update_counter += 1
+        if self._update_counter % self.update_interval == 0:
+            print(f"\n--- [Self-Play] Updating opponent policy with main policy weights (Iteration: {self._update_counter}) ---\n")
+            
+            main_policy = algorithm.get_policy("main_policy")
+            opponent_policy = algorithm.get_policy("opponent_policy")
+            
+            if main_policy and opponent_policy:
+                main_weights = main_policy.get_weights()
+                opponent_policy.set_weights(main_weights)
+                result["custom_metrics"]["opponent_updated"] = 1.0
+            else:
+                result["custom_metrics"]["opponent_updated"] = 0.0
 
-def get_shared_policy_mapping_fn(agent_id, episode, worker, **kwargs):
-    """ Mappt alle Agenten zu einer einzigen Policy. """
-    return "shared_policy"
+def get_self_play_policy_mapping_fn(agent_id, episode, worker, **kwargs):
+    return "main_policy" if "left" in agent_id else "opponent_policy"
 
 
 def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
@@ -173,14 +187,22 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
 
     config.environment(
         env="gfootball_multi",
-        env_config={"debug_mode": debug_mode},
+        env_config={
+            "debug_mode": debug_mode,
+            "env_name": "academy_pass_and_shoot_with_keeper",
+            "number_of_left_players_agent_controls": 1,
+            "number_of_right_players_agent_controls": 0,
+            "rewards": "scoring",
+        },
         disable_env_checking=True,
     )
+
     config.framework(framework="torch")
 
     config.env_runners(
         num_env_runners=0 if debug_mode else 22,
         num_envs_per_env_runner=2,
+        gym_env_vectorize_mode="ASYNC",
         rollout_fragment_length=10 if debug_mode else 64,
         num_cpus_per_env_runner=1,
     )
@@ -200,7 +222,6 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
             "framestack": False,
             "fcnet_hiddens": [256, 256],
             "fcnet_activation": "silu",
-            # Die Attention-Parameter sind für komplexes Zusammenspiel gedacht.
             "use_attention": True,
             "attention_num_transformer_units": 2,
             "attention_dim": 192,
@@ -224,30 +245,20 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
         num_cpus_per_learner=1,
     )
     
-    # === Wahl der Multi-Agent Strategie ===
-    # "shared": Symmetrisches Self-Play. Ein Modell steuert beide Teams.
-    # "separate": Asymmetrisches Self-Play. Zwei Modelle, eins kann eingefroren werden.
-    policy_mapping_mode = "shared" 
+    policies = {
+        "main_policy": PolicySpec(),
+        "opponent_policy": PolicySpec(),
+    }
     
-    if policy_mapping_mode == "shared":
-        policies = {"shared_policy": PolicySpec()}
-        policies_to_train = ["shared_policy"]
-        mapping_fn = get_shared_policy_mapping_fn
-    else: # "separate"
-        policies = {
-            "left_team": PolicySpec(),
-            "right_team": PolicySpec(),
-        }
-        # Für echtes Self-Play müsstest du diese Liste dynamisch anpassen
-        # z.B. nur ["left_team"] trainieren und `right_team` regelmäßig updaten.
-        policies_to_train = ["left_team", "right_team"]
-        mapping_fn = get_policy_mapping_fn
+    policies_to_train = ["main_policy"]
     
     config.multi_agent(
         policies=policies,
-        policy_mapping_fn=mapping_fn,
+        policy_mapping_fn=get_self_play_policy_mapping_fn,
         policies_to_train=policies_to_train,
     )
+    
+    config.callbacks(lambda: SelfPlayCallback(update_interval=25))
     
     if not debug_mode:
         config.evaluation(
@@ -261,7 +272,6 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
     config.debugging(seed=42, log_level="INFO")
 
     return config
-
 
 def train():
     debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
@@ -278,9 +288,8 @@ def train():
 
     script_path = Path(__file__).resolve().parent
     results_path = script_path / "training_results"
-    print(f"Alle Trainingsergebnisse werden in folgendem Ordner gespeichert: {results_path}")
+    print(f"All training results will be saved in: {results_path}")
 
-    # Logik zum Fortsetzen des letzten Trainings
     resume_from_path = None
     if results_path.exists():
         experiment_folders = [d for d in results_path.iterdir() if d.is_dir()]
@@ -289,28 +298,27 @@ def train():
             resume_from_path = str(latest_experiment)
 
     stop_criteria = {
-        "episode_reward_mean": 20.0,
+        "env_runners/episode_return_mean": 20.0,
         "timesteps_total": 1_000_000_000,
     }
     
     checkpoint_config = CheckpointConfig(
         num_to_keep=5,
         checkpoint_frequency=10,
-        checkpoint_score_attribute="episode_reward_mean",
+        checkpoint_score_attribute="env_runners/episode_return_mean",
         checkpoint_score_order="max",
         checkpoint_at_end=True,
     )
 
     if resume_from_path:
-        print(f"Neuestes Experiment gefunden. Setze Training fort von: {resume_from_path}")
+        print(f"Found latest experiment. Resuming training from: {resume_from_path}")
         tuner = tune.Tuner.restore(
             path=resume_from_path,
             trainable="IMPALA",
             resume_errored=True,
-            param_space=impala_config.to_dict(),
         )
     else:
-        print("Kein bestehendes Experiment gefunden. Starte ein neues Training.")
+        print("No existing experiment found. Starting a new training run.")
         tuner = tune.Tuner(
             "IMPALA",
             param_space=impala_config.to_dict(),
@@ -329,9 +337,9 @@ def train():
         mode="max"
     )
     if best_result and best_result.checkpoint:
-        print("Training beendet. Bester Checkpoint gefunden unter:", best_result.checkpoint)
+        print("Training finished. Best checkpoint found at:", best_result.checkpoint)
     else:
-        print("Training beendet. Es wurde kein bester Checkpoint gefunden.")
+        print("Training finished. No best checkpoint was found.")
 
     ray.shutdown()
 
