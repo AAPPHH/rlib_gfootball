@@ -18,6 +18,7 @@ from ray.rllib.utils.typing import MultiAgentDict
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
+from ray.tune.schedulers import PopulationBasedTraining
 
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
@@ -59,7 +60,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         reset_result = self.env.reset()
         test_obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         
-        # Handle case where env might not have agents
         if len(self.agent_ids) == 0:
             single_obs_shape = test_obs.shape
         elif len(test_obs.shape) > 1:
@@ -133,7 +133,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
 
     def _split_obs(self, obs: np.ndarray) -> MultiAgentDict:
         if not self.agent_ids:
-             return {}
+            return {}
         if len(obs.shape) == 1:
             obs_per_agent = obs.shape[0] // len(self.agent_ids)
             obs = obs.reshape(len(self.agent_ids), obs_per_agent)
@@ -177,7 +177,7 @@ def get_self_play_policy_mapping_fn(agent_id, episode, worker, **kwargs):
     return "main_policy" if "left" in agent_id else "opponent_policy"
 
 
-def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
+def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
     config = ImpalaConfig()
 
     config.api_stack(
@@ -192,7 +192,7 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
             "env_name": "academy_pass_and_shoot_with_keeper",
             "number_of_left_players_agent_controls": 1,
             "number_of_right_players_agent_controls": 0,
-            "rewards": "scoring",
+            "rewards": "scoring,checkpoints",
         },
         disable_env_checking=True,
     )
@@ -208,16 +208,20 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
     )
 
     config.fault_tolerance(restart_failed_env_runners=True)
-    
+
+    if hyperparams is None:
+        hyperparams = {
+            "lr": 0.0001,
+            "entropy_coeff": 0.008,
+            "vf_loss_coeff": 0.5
+        }
+
     config.training(
-        lr_schedule=[
-            [0, 0.0001],
-            [25_000_000, 0.000001],
-        ],
+        lr=hyperparams["lr"],
+        entropy_coeff=hyperparams["entropy_coeff"],
+        vf_loss_coeff=hyperparams["vf_loss_coeff"],
         train_batch_size=50 if debug_mode else 2048,
         grad_clip=0.5,
-        vf_loss_coeff=0.5,
-        entropy_coeff=0.008,
         model={
             "framestack": False,
             "fcnet_hiddens": [256, 256],
@@ -273,6 +277,8 @@ def create_impala_config(debug_mode: bool = False) -> ImpalaConfig:
 
     return config
 
+# --- Angepasste Haupt-Trainingsfunktion für PBT ---
+
 def train():
     debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
     
@@ -284,18 +290,32 @@ def train():
     
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
     
-    impala_config = create_impala_config(debug_mode=debug_mode)
+    pbt_scheduler = PopulationBasedTraining(
+        time_attr="timesteps_total",
+        metric="env_runners/episode_return_mean",
+        mode="max",
+        perturbation_interval=5_000_000,
+        hyperparam_mutations={
+            "lr": tune.loguniform(1e-5, 1e-3),
+            "entropy_coeff": tune.uniform(0.0, 0.02),
+            "vf_loss_coeff": tune.uniform(0.1, 1.0),
+        }
+    )
+
+    param_space = create_impala_config(
+        debug_mode=debug_mode,
+        hyperparams={
+            "lr": tune.choice([0.0005, 0.0003, 0.0001]),
+            "entropy_coeff": tune.choice([0.006, 0.008, 0.01]),
+            "vf_loss_coeff": tune.choice([0.4, 0.5, 0.6]),
+        }
+    ).to_dict()
 
     script_path = Path(__file__).resolve().parent
-    results_path = script_path / "training_results"
-    print(f"All training results will be saved in: {results_path}")
+    results_path = script_path / "training_results_pbt"
+    print(f"All PBT training results will be saved in: {results_path}")
 
     resume_from_path = None
-    if results_path.exists():
-        experiment_folders = [d for d in results_path.iterdir() if d.is_dir()]
-        if experiment_folders:
-            latest_experiment = max(experiment_folders, key=lambda p: p.name)
-            resume_from_path = str(latest_experiment)
 
     stop_criteria = {
         "env_runners/episode_return_mean": 20.0,
@@ -304,31 +324,27 @@ def train():
     
     checkpoint_config = CheckpointConfig(
         num_to_keep=5,
-        checkpoint_frequency=10,
+        checkpoint_frequency=50,
         checkpoint_score_attribute="env_runners/episode_return_mean",
         checkpoint_score_order="max",
         checkpoint_at_end=True,
     )
-
-    if resume_from_path:
-        print(f"Found latest experiment. Resuming training from: {resume_from_path}")
-        tuner = tune.Tuner.restore(
-            path=resume_from_path,
-            trainable="IMPALA",
-            resume_errored=True,
-        )
-    else:
-        print("No existing experiment found. Starting a new training run.")
-        tuner = tune.Tuner(
-            "IMPALA",
-            param_space=impala_config.to_dict(),
-            run_config=RunConfig( 
-                stop=stop_criteria,
-                checkpoint_config=checkpoint_config,
-                name=f"gfootball_impala_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                storage_path=str(results_path),
-            ),
-        )
+    
+    print("No existing experiment found. Starting a new PBT training run.")
+    tuner = tune.Tuner(
+        "IMPALA",
+        param_space=param_space,
+        tune_config=tune.TuneConfig(
+            scheduler=pbt_scheduler,
+            num_samples=3,
+        ),
+        run_config=RunConfig( 
+            stop=stop_criteria,
+            checkpoint_config=checkpoint_config,
+            name=f"gfootball_impala_pbt_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            storage_path=str(results_path),
+        ),
+    )
     
     results = tuner.fit()
     
@@ -342,6 +358,7 @@ def train():
         print("Training finished. No best checkpoint was found.")
 
     ray.shutdown()
+
 
 if __name__ == "__main__":
     train()
