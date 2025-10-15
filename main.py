@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+from dataclasses import dataclass
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -14,41 +15,54 @@ from ray.rllib.algorithms.impala import ImpalaConfig
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.utils.typing import MultiAgentDict
-
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune.schedulers import PopulationBasedTraining
+from ray.tune.callback import Callback
 
+
+@dataclass
+class TrainingStage:
+    name: str
+    env_name: str
+    representation: str
+    left_players: int
+    right_players: int
+    target_reward: float
+    max_timesteps: int
+    description: str = ""
+
+TRAINING_STAGES = [
+    TrainingStage("stage_1_basic", "academy_pass_and_shoot_with_keeper", "extracted", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
+    TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "extracted", 1, 1, 0.75, 20_000_000, "1v1 Spiel"),
+    TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "extracted", 3, 3, 1.0, 50_000_000, "3v3 Kleinfeld"),
+    TrainingStage("stage_4_5v5", "11_vs_11_stochastic", "extracted", 5, 5, 1.0, 100_000_000, "5v5 Mittelfeld"),
+    TrainingStage("stage_5_11v11", "11_vs_11_stochastic", "extracted", 11, 11, 1.0, 500_000_000, "11v11 Vollspiel"),
+]
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        
-        default_env_config = {
-            "env_name": "11_vs_11_stochastic",
-            "representation": "simple115v2",
-            "rewards": "scoring,checkpoints",
-            "number_of_left_players_agent_controls": 11,
-            "number_of_right_players_agent_controls": 11,
-            "stacked": True,
-            "logdir": "/tmp/gfootball",
-            "write_goal_dumps": False,
-            "write_full_episode_dumps": False,
-            "render": False,
-            "write_video": False,
-            "dump_frequency": 1,
+        default_config = {
+            "env_name": "11_vs_11_stochastic", "representation": "simple115v2",
+            "rewards": "scoring,checkpoints", "number_of_left_players_agent_controls": 11,
+            "number_of_right_players_agent_controls": 11, "stacked": True,
+            "logdir": "/tmp/gfootball", "write_goal_dumps": False,
+            "write_full_episode_dumps": False, "render": False,
+            "write_video": False, "dump_frequency": 1,
         }
-        
-        self.env_config = {**default_env_config, **config}
+        self.env_config = {**default_config, **config}
         self.debug_mode = self.env_config.get("debug_mode", False)
         if self.debug_mode:
-            self._apply_debug_overrides()
+            self.env_config.update({"render": True, "write_video": True})
 
         self.left_players = self.env_config["number_of_left_players_agent_controls"]
         self.right_players = self.env_config["number_of_right_players_agent_controls"]
         
-        self._create_env()
+        creation_kwargs = self.env_config.copy()
+        creation_kwargs.pop("debug_mode", None)
+        self.env = football_env.create_environment(**creation_kwargs)
         
         self.agent_ids = [f"left_{i}" for i in range(self.left_players)] + \
                          [f"right_{i}" for i in range(self.right_players)]
@@ -57,308 +71,184 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         reset_result = self.env.reset()
         test_obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         
-        if len(self.agent_ids) == 0:
-            single_obs_shape = test_obs.shape
-        elif len(test_obs.shape) > 1:
-            single_obs_shape = test_obs[0].shape
+        if not self.agent_ids: single_obs_shape = test_obs.shape
+        elif len(test_obs.shape) > 1: single_obs_shape = test_obs[0].shape
         else:
-            num_features = test_obs.shape[0]
-            num_agents = len(self.agent_ids)
-            assert num_features % num_agents == 0, \
-                f"Observation size ({num_features}) is not cleanly " \
-                f"divisible by the number of agents ({num_agents})."
-            single_obs_shape = (num_features // num_agents,)
+            assert test_obs.shape[0] % len(self.agent_ids) == 0
+            single_obs_shape = (test_obs.shape[0] // len(self.agent_ids),)
 
-        single_obs_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=single_obs_shape,
-            dtype=np.float32
-        )
-        single_act_space = spaces.Discrete(19)
+        self.observation_space = spaces.Dict({
+            agent_id: spaces.Box(low=-np.inf, high=np.inf, shape=single_obs_shape, dtype=np.float32)
+            for agent_id in self.agent_ids})
+        self.action_space = spaces.Dict({
+            agent_id: spaces.Discrete(19) for agent_id in self.agent_ids})
 
-        self.observation_space = spaces.Dict({agent_id: single_obs_space for agent_id in self.agent_ids})
-        self.action_space = spaces.Dict({agent_id: single_act_space for agent_id in self.agent_ids})
-
-    def _apply_debug_overrides(self):
-        self.env_config["render"] = True
-        self.env_config["write_video"] = True
-
-    def _create_env(self):
-        creation_kwargs = self.env_config.copy()
-        creation_kwargs.pop("debug_mode", None)
-        self.env = football_env.create_environment(**creation_kwargs)
-
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[MultiAgentDict, MultiAgentDict]:
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed, options=options)
-        
         reset_result = self.env.reset()
         obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-        
-        multi_agent_obs = self._split_obs(obs)
-        infos = {agent_id: {} for agent_id in self.agent_ids}
-        return multi_agent_obs, infos
+        return self._split_obs(obs), {aid: {} for aid in self.agent_ids}
 
-    def step(self, action_dict: MultiAgentDict) -> Tuple[MultiAgentDict, MultiAgentDict, MultiAgentDict, MultiAgentDict, MultiAgentDict]:
-        actions = [action_dict.get(agent_id, 0) for agent_id in self.agent_ids]
-        
+    def step(self, action_dict):
+        actions = [action_dict.get(aid, 0) for aid in self.agent_ids]
         step_result = self.env.step(actions)
         
-        obs, rewards, done, info = step_result
-        terminated, truncated = done, False
-
-        multi_agent_obs = self._split_obs(obs)
-        multi_agent_rewards = self._split_rewards(rewards)
+        if len(step_result) == 5:
+            obs, rewards, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:
+            obs, rewards, done, info = step_result
+            terminated, truncated = done, False
         
-        multi_agent_terminateds = {agent_id: done for agent_id in self.agent_ids}
-        multi_agent_truncateds = {agent_id: truncated for agent_id in self.agent_ids}
-        multi_agent_terminateds["__all__"] = done
-        multi_agent_truncateds["__all__"] = done
-        
-        multi_agent_infos = {agent_id: info for agent_id in self.agent_ids}
+        dones = {aid: done for aid in self.agent_ids}; dones["__all__"] = done
+        truncs = {aid: truncated for aid in self.agent_ids}; truncs["__all__"] = truncated
         
         if self.debug_mode:
-            import time
-            time.sleep(1.0 / 20)
+            import time; time.sleep(0.05)
 
-        return (multi_agent_obs, multi_agent_rewards, multi_agent_terminateds, 
-                multi_agent_truncateds, multi_agent_infos)
+        return (self._split_obs(obs), self._split_rewards(rewards), dones, 
+                truncs, {aid: info for aid in self.agent_ids})
 
-    def _split_obs(self, obs: np.ndarray) -> MultiAgentDict:
-        if not self.agent_ids:
-            return {}
-        if len(obs.shape) == 1:
-            obs_per_agent = obs.shape[0] // len(self.agent_ids)
-            obs = obs.reshape(len(self.agent_ids), obs_per_agent)
-        
+    def _split_obs(self, obs):
+        if not self.agent_ids: return {}
+        if len(obs.shape) == 1: obs = obs.reshape(len(self.agent_ids), -1)
         return {self.agent_ids[i]: obs[i].astype(np.float32) for i in range(len(self.agent_ids))}
 
-    def _split_rewards(self, rewards) -> MultiAgentDict:
-        if np.isscalar(rewards):
-            return {agent_id: float(rewards) for agent_id in self.agent_ids}
-        
+    def _split_rewards(self, rewards):
+        if np.isscalar(rewards): return {aid: float(rewards) for aid in self.agent_ids}
         return {self.agent_ids[i]: float(rewards[i]) for i in range(len(self.agent_ids))}
 
-    def render(self):
-        return self.env.render()
+    def close(self): self.env.close()
 
-    def close(self):
-        self.env.close()
+class RestoreCheckpointCallback(Callback):
+    def __init__(self, checkpoint_path: str):
+        super().__init__()
+        self.checkpoint_path = checkpoint_path
+
+    def on_trial_start(self, iteration: int, trials: list, trial, **info):
+        print(f"Trial {trial.trial_id} loading weights from: {self.checkpoint_path}")
+        trial.get_trainable().restore(self.checkpoint_path)
+
+def get_policy_mapping_fn(agent_id, episode, worker, **kwargs):
+    return "policy_left" if "left" in agent_id else "policy_right"
+
+def select_policy_to_train(algorithm, train_batch, **kwargs):
+    """Dynamically selects which policy to train based on the callback's state."""
+    metrics = algorithm.get_local_worker().get_metrics()
+    active_policy = metrics.get("custom_metrics", {}).get("active_policy", "policy_left")
+    return [active_policy]
 
 class SelfPlayCallback(DefaultCallbacks):
-    def __init__(self, update_interval: int = 25, has_left_agents: bool = True, has_right_agents: bool = True):
+    def __init__(self, update_interval=25, has_left_agents=True, has_right_agents=True):
         super().__init__()
         self.update_interval = update_interval
         self._update_counter = 0
-        self.has_left_agents = has_left_agents
-        self.has_right_agents = has_right_agents
-        
-        self.self_play_enabled = self.has_left_agents and self.has_right_agents
-        
-        if self.self_play_enabled:
-            self.active_policy_name = "policy_left"
-            print("\n" + "="*60)
-            print("SELF-PLAY MODUS AKTIVIERT")
-            print("Beide Teams vorhanden - Policies werden abwechselnd trainiert")
-            print("="*60 + "\n")
-        elif self.has_left_agents:
-            self.active_policy_name = "policy_left"
-            print("\n" + "="*60)
-            print("NUR LEFT AGENTS - Nur policy_left wird trainiert")
-            print("="*60 + "\n")
-        elif self.has_right_agents:
-            self.active_policy_name = "policy_right"
-            print("\n" + "="*60)
-            print("NUR RIGHT AGENTS - Nur policy_right wird trainiert")
-            print("="*60 + "\n")
+        self.self_play_enabled = has_left_agents and has_right_agents
+        self.active_policy_name = "policy_left"
 
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
-        self._update_counter += 1
-        
-        # Wenn kein Self-Play, nichts zu tun
-        if not self.self_play_enabled:
-            return
-        
-        policy_left = algorithm.get_policy("policy_left")
-        policy_right = algorithm.get_policy("policy_right")
-
-        if not policy_left or not policy_right:
-            return
-
-        if self.active_policy_name == "policy_left":
-            frozen_policy = policy_right
-            frozen_policy.set_weights(policy_left.get_weights())
-            result["custom_metrics"]["frozen_policy"] = "policy_right"
-        else:
-            frozen_policy = policy_left
-            frozen_policy.set_weights(policy_right.get_weights())
-            result["custom_metrics"]["frozen_policy"] = "policy_left"
-
-        if self._update_counter % self.update_interval == 0:
+        if self.self_play_enabled and self._update_counter % self.update_interval == 0:
             self.active_policy_name = "policy_right" if self.active_policy_name == "policy_left" else "policy_left"
+            print(f"\n--- Active training policy will switch to: {self.active_policy_name} for the next iterations ---")
+        
+        result["custom_metrics"]["active_policy"] = self.active_policy_name
+
+        if self.self_play_enabled:
+            active_policy_obj = algorithm.get_policy(self.active_policy_name)
+            inactive_policy_name = "policy_left" if self.active_policy_name == "policy_right" else "policy_right"
+            inactive_policy_obj = algorithm.get_policy(inactive_policy_name)
             
-            algorithm.config.policies_to_train = [self.active_policy_name]
-            
-            print(f"\n{'='*60}")
-            print(f"POLICY SWITCH - Iteration {self._update_counter}")
-            print(f"Aktive (trainierende) Policy: {self.active_policy_name}")
-            print(f"Eingefrorene Policy: {'policy_left' if self.active_policy_name == 'policy_right' else 'policy_right'}")
-            print(f"{'='*60}\n")
-            
-            result["custom_metrics"]["active_policy"] = self.active_policy_name
+            if active_policy_obj and inactive_policy_obj:
+                inactive_policy_obj.set_weights(active_policy_obj.get_weights())
+        
+        self._update_counter += 1
 
-
-def get_self_play_policy_mapping_fn(agent_id, episode, worker, **kwargs):
-    return "policy_left" if "left" in agent_id else "policy_right"
-
-
-def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
+def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
     config = ImpalaConfig()
-
-    config.api_stack(
-        enable_rl_module_and_learner=False,
-        enable_env_runner_and_connector_v2=False
-    )
-
+    config.api_stack(enable_rl_module_and_learner=False, enable_env_runner_and_connector_v2=False)
+    
     env_config = {
-        "debug_mode": debug_mode,
-        "representation": "extracted",
-        "env_name": "academy_pass_and_shoot_with_keeper",
-        "number_of_left_players_agent_controls": 1,
-        "number_of_right_players_agent_controls": 0,
+        "debug_mode": debug_mode, "representation": stage.representation, "env_name": stage.env_name,
+        "number_of_left_players_agent_controls": stage.left_players,
+        "number_of_right_players_agent_controls": stage.right_players,
         "rewards": "scoring,checkpoints",
     }
-
-    config.environment(
-        env="gfootball_multi",
-        env_config=env_config,
-        disable_env_checking=True,
-    )
-
-    config.framework(framework="torch")
-
-    config.env_runners(
-        num_env_runners=0 if debug_mode else 6,
-        num_envs_per_env_runner=2,
-        gym_env_vectorize_mode="ASYNC",
-        create_env_on_local_worker=True,
-        rollout_fragment_length=10 if debug_mode else 64,
-        num_cpus_per_env_runner=1,
-    )
-
+    config.environment("gfootball_multi", env_config=env_config, disable_env_checking=True)
+    config.framework("torch")
+    config.env_runners(num_env_runners=0 if debug_mode else 7, num_envs_per_env_runner=2,
+                     rollout_fragment_length=10 if debug_mode else 64)
     config.fault_tolerance(restart_failed_env_runners=True)
-
+    
     if hyperparams is None:
-        hyperparams = {
-            "lr": 0.0001,
-            "entropy_coeff": 0.008,
-            "vf_loss_coeff": 0.5
-        }
+        hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
+
+    model_config = {
+        "framestack": True,
+        "conv_filters": [
+            [24, [3, 3], 2], [24, [3, 3], 1],
+            [48, [3, 3], 2], [48, [3, 3], 1],
+            [96, [3, 3], 2], [96, [3, 3], 1],
+        ],
+        "conv_activation": "silu",
+        "use_attention": True,
+        "attention_num_transformer_units": 2,
+        "attention_dim": 192,
+        "attention_num_heads": 3,
+        "attention_head_dim": 64,
+        "attention_memory_inference": 64,
+        "attention_memory_training": 64,
+        "attention_position_wise_mlp_dim": 768,
+        "max_seq_len": 64,
+        "fcnet_hiddens": [384, 384],
+        "fcnet_activation": "silu",
+    }
 
     config.training(
-        lr=hyperparams["lr"],
+        lr=hyperparams["lr"], 
         entropy_coeff=hyperparams["entropy_coeff"],
-        vf_loss_coeff=hyperparams["vf_loss_coeff"],
-        train_batch_size=128 if debug_mode else 16_384,
-        minibatch_size=32 if debug_mode else 2048,
+        vf_loss_coeff=hyperparams["vf_loss_coeff"], 
         grad_clip=0.5,
-        model = {
-            "framestack": True,
-            "conv_filters": [
-                [16, [3, 3], 1],
-                [16, [3, 3], 1],
-                [32, [3, 3], 2],
-                [32, [3, 3], 1],
-                [32, [3, 3], 1],
-                [64, [3, 3], 2],
-                [64, [3, 3], 1],
-                [64, [3, 3], 1],
-            ],
-            "conv_activation": "silu",
-            "use_attention": True,
-            "attention_num_transformer_units": 1,
-            "attention_dim": 128,
-            "attention_num_heads": 2,
-            "attention_head_dim": 64,
-            "attention_memory_inference": 32,
-            "attention_memory_training": 32,
-            "attention_position_wise_mlp_dim": 512,
-            "max_seq_len": 64,
-            "fcnet_hiddens": [256, 256],
-            "fcnet_activation": "silu",
-        }
+        train_batch_size=8192 if not debug_mode else 128,
+        minibatch_size=1024 if not debug_mode else 128,
+        model=model_config
     )
 
-    config.resources(
-        num_gpus=1/3,
-        num_cpus_for_main_process=1,
-    )
-    
-    config.learners(
-        num_learners=1,
-        num_gpus_per_learner=1/3,
-        num_cpus_per_learner=1,
-    )
-
-    has_left_agents = env_config["number_of_left_players_agent_controls"] > 0
-    has_right_agents = env_config["number_of_right_players_agent_controls"] > 0
+    config.resources(num_gpus=1/3, num_cpus_for_main_process=1)
+    config.learners(num_learners=1, num_gpus_per_learner=1/3, num_cpus_per_learner=1)
 
     policies = {}
-    policies_to_train = []
-    
-    if has_left_agents:
-        policies["policy_left"] = PolicySpec()
-        policies_to_train.append("policy_left")
-    
-    if has_right_agents:
-        policies["policy_right"] = PolicySpec()
-        if not has_left_agents:
-            policies_to_train.append("policy_right")
-    
-
-    if has_left_agents and has_right_agents:
-        policies_to_train = ["policy_left"]
+    has_left, has_right = stage.left_players > 0, stage.right_players > 0
+    if has_left: policies["policy_left"] = PolicySpec()
+    if has_right: policies["policy_right"] = PolicySpec()
+        
+    policies_to_train_fn = None
+    if has_left and has_right:
+        policies_to_train_fn = select_policy_to_train
+    elif has_left:
+        policies_to_train_fn = ["policy_left"]
+    else:
+        policies_to_train_fn = ["policy_right"]
     
     config.multi_agent(
-        policies=policies,
-        policy_mapping_fn=get_self_play_policy_mapping_fn,
-        policies_to_train=policies_to_train,
+        policies=policies, 
+        policy_mapping_fn=get_policy_mapping_fn, 
+        policies_to_train=policies_to_train_fn
     )
-    
-    config.callbacks(
-        lambda: SelfPlayCallback(
-            update_interval=25,
-            has_left_agents=has_left_agents,
-            has_right_agents=has_right_agents
-        )
-    )
-    
-    if not debug_mode:
-        config.evaluation(
-            evaluation_interval=50,
-            evaluation_duration=10,
-            evaluation_duration_unit="episodes",
-            evaluation_num_env_runners=1,
-            evaluation_config=config.overrides(explore=False),
-        )
-        
-    config.debugging(seed=42, log_level="INFO")
-
+    config.callbacks(lambda: SelfPlayCallback(25, has_left, has_right))
+    config.debugging(seed=42, log_level="WARN")
     return config
 
+def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
+    print("\n" + "="*80)
+    print(f"STARTING STAGE {stage_index + 1}: {stage.name} - {stage.description}")
+    if restore_checkpoint:
+        print(f"  -> Initializing all trials from: {restore_checkpoint}")
+    print("="*80 + "\n")
 
-def train():
-    debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
-    
-    ray.init(
-        ignore_reinit_error=True,
-        log_to_driver=False,
-        local_mode=debug_mode,
-    )
-    
-    register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
+    results_path = Path(__file__).resolve().parent / "training_results_transfer_pbt"
 
     param_space = create_impala_config(
+        stage=stage,
         debug_mode=debug_mode,
         hyperparams={
             "lr": tune.choice([0.0005, 0.0003, 0.0001]),
@@ -367,27 +257,20 @@ def train():
         }
     ).to_dict()
 
-    script_path = Path(__file__).resolve().parent
-    results_path = script_path / "training_results_pbt"
-
     stop_criteria = {
-        "env_runners/episode_return_mean": 20.0,
-        "timesteps_total": 1_000_000_000,
+        "env_runners/episode_return_mean": stage.target_reward,
+        "timesteps_total": stage.max_timesteps,
     }
     
     checkpoint_config = CheckpointConfig(
-        num_to_keep=5,
-        checkpoint_frequency=50,
+        num_to_keep=3, checkpoint_frequency=50,
         checkpoint_score_attribute="env_runners/episode_return_mean",
-        checkpoint_score_order="max",
-        checkpoint_at_end=True,
+        checkpoint_score_order="max", checkpoint_at_end=True,
     )
-
+    
     pbt_scheduler = PopulationBasedTraining(
-        time_attr="timesteps_total",
-        metric="env_runners/episode_return_mean",
-        mode="max",
-        perturbation_interval=102_400,
+        time_attr="timesteps_total", metric="env_runners/episode_return_mean",
+        mode="max", perturbation_interval=128_000,
         hyperparam_mutations={
             "lr": tune.loguniform(1e-5, 1e-3),
             "entropy_coeff": tune.uniform(0.0, 0.02),
@@ -395,33 +278,77 @@ def train():
         }
     )
     
+    run_callbacks = []
+    if restore_checkpoint:
+        run_callbacks.append(RestoreCheckpointCallback(checkpoint_path=restore_checkpoint))
+
     tuner = tune.Tuner(
         "IMPALA",
         param_space=param_space,
-        tune_config=tune.TuneConfig(
-            scheduler=pbt_scheduler,
-            num_samples=3,
-        ),
-        run_config=RunConfig( 
+        tune_config=tune.TuneConfig(scheduler=pbt_scheduler, num_samples=3),
+        run_config=RunConfig(
             stop=stop_criteria,
             checkpoint_config=checkpoint_config,
-            name=f"gfootball_impala_pbt_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=f"{stage.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             storage_path=str(results_path),
+            callbacks=run_callbacks
         ),
     )
     
     results = tuner.fit()
+    best_result = results.get_best_result(metric="env_runners/episode_return_mean", mode="max")
     
-    best_result = results.get_best_result(
-        metric="env_runners/episode_return_mean", 
-        mode="max"
-    )
     if best_result and best_result.checkpoint:
-        print("Training finished. Best checkpoint found at:", best_result.checkpoint)
+        checkpoint_path = str(best_result.checkpoint.path)
+        print(f"\nSTAGE {stage_index + 1} COMPLETE. Best checkpoint: {checkpoint_path}")
+        return checkpoint_path
     else:
-        print("Training finished. No best checkpoint was found.")
+        print(f"\nWarning: No best checkpoint found for stage {stage.name}.")
+        return None
 
+def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
+    if end_stage is None: end_stage = len(TRAINING_STAGES) - 1
+    
+    print("\n" + "="*80)
+    print("STARTING PROGRESSIVE TRANSFER LEARNING WITH PBT")
+    print(f"Stages: {start_stage + 1} to {end_stage + 1} of {len(TRAINING_STAGES)}")
+    print("="*80 + "\n")
+    
+    current_checkpoint = initial_checkpoint
+    
+    for i in range(start_stage, end_stage + 1):
+        stage = TRAINING_STAGES[i]
+        checkpoint = train_single_stage(stage, i, debug_mode, current_checkpoint)
+        if checkpoint:
+            current_checkpoint = checkpoint
+        else:
+            print(f"Stopping progressive training: Stage {i+1} did not produce a valid checkpoint.")
+            break
+            
+    print("\n" + "="*80)
+    print("PROGRESSIVE TRAINING COMPLETE")
+    if current_checkpoint:
+        print(f"Final Checkpoint Path: {current_checkpoint}")
+    print("="*80 + "\n")
+
+def main():
+    debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
+    use_transfer = os.environ.get("GFOOTBALL_TRANSFER", "true").lower() == "true"
+    start_stage = int(os.environ.get("GFOOTBALL_START_STAGE", "0"))
+    end_stage_env = os.environ.get("GFOOTBALL_END_STAGE", "")
+    end_stage = int(end_stage_env) if end_stage_env else None
+    initial_checkpoint = os.environ.get("GFOOTBALL_CHECKPOINT", None)
+    
+    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
+    register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
+    
+    if use_transfer:
+        train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint)
+    else:
+        stage = TRAINING_STAGES[start_stage]
+        train_single_stage(stage, start_stage, debug_mode, initial_checkpoint)
+    
     ray.shutdown()
 
 if __name__ == "__main__":
-    train()
+    main()
