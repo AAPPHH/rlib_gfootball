@@ -185,23 +185,25 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperpa
     model_config = {
         "framestack": True,
         "conv_filters": [
-            [24, [3, 3], 2], [24, [3, 3], 1],
-            [48, [3, 3], 2], [48, [3, 3], 1],
-            [96, [3, 3], 2], [96, [3, 3], 1],
+            [32, [3, 3], 2], [32, [3, 3], 1],
+            [64, [3, 3], 2], [64, [3, 3], 1],
+            [128, [3, 3], 2], [128, [3, 3], 1],
         ],
         "conv_activation": "silu",
         "use_attention": True,
-        "attention_num_transformer_units": 2,
-        "attention_dim": 192,
-        "attention_num_heads": 3,
+        "attention_num_transformer_units": 3,   # +1 Block
+        "attention_dim": 256,                   # 4*64
+        "attention_num_heads": 4,
         "attention_head_dim": 64,
         "attention_memory_inference": 64,
         "attention_memory_training": 64,
-        "attention_position_wise_mlp_dim": 768,
+        "attention_position_wise_mlp_dim": 1024,
         "max_seq_len": 64,
-        "fcnet_hiddens": [384, 384],
+        "fcnet_hiddens": [512, 512],
         "fcnet_activation": "silu",
     }
+
+
 
     config.training(
         lr=hyperparams["lr"], 
