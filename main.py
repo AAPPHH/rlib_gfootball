@@ -104,12 +104,8 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         
         step_result = self.env.step(actions)
         
-        if len(step_result) == 5:
-            obs, rewards, terminated, truncated, info = step_result
-            done = terminated or truncated
-        else:
-            obs, rewards, done, info = step_result
-            terminated, truncated = done, False
+        obs, rewards, done, info = step_result
+        terminated, truncated = done, False
 
         multi_agent_obs = self._split_obs(obs)
         multi_agent_rewards = self._split_rewards(rewards)
@@ -150,26 +146,71 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         self.env.close()
 
 class SelfPlayCallback(DefaultCallbacks):
-    def __init__(self, update_interval: int = 25):
+    def __init__(self, update_interval: int = 25, has_left_agents: bool = True, has_right_agents: bool = True):
         super().__init__()
         self.update_interval = update_interval
         self._update_counter = 0
+        self.has_left_agents = has_left_agents
+        self.has_right_agents = has_right_agents
+        
+        self.self_play_enabled = self.has_left_agents and self.has_right_agents
+        
+        if self.self_play_enabled:
+            self.active_policy_name = "policy_left"
+            print("\n" + "="*60)
+            print("SELF-PLAY MODUS AKTIVIERT")
+            print("Beide Teams vorhanden - Policies werden abwechselnd trainiert")
+            print("="*60 + "\n")
+        elif self.has_left_agents:
+            self.active_policy_name = "policy_left"
+            print("\n" + "="*60)
+            print("NUR LEFT AGENTS - Nur policy_left wird trainiert")
+            print("="*60 + "\n")
+        elif self.has_right_agents:
+            self.active_policy_name = "policy_right"
+            print("\n" + "="*60)
+            print("NUR RIGHT AGENTS - Nur policy_right wird trainiert")
+            print("="*60 + "\n")
 
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
         self._update_counter += 1
+        
+        # Wenn kein Self-Play, nichts zu tun
+        if not self.self_play_enabled:
+            return
+        
+        policy_left = algorithm.get_policy("policy_left")
+        policy_right = algorithm.get_policy("policy_right")
+
+        if not policy_left or not policy_right:
+            return
+
+        if self.active_policy_name == "policy_left":
+            frozen_policy = policy_right
+            frozen_policy.set_weights(policy_left.get_weights())
+            result["custom_metrics"]["frozen_policy"] = "policy_right"
+        else:
+            frozen_policy = policy_left
+            frozen_policy.set_weights(policy_right.get_weights())
+            result["custom_metrics"]["frozen_policy"] = "policy_left"
+
         if self._update_counter % self.update_interval == 0:
-            main_policy = algorithm.get_policy("main_policy")
-            opponent_policy = algorithm.get_policy("opponent_policy")
+            self.active_policy_name = "policy_right" if self.active_policy_name == "policy_left" else "policy_left"
             
-            if main_policy and opponent_policy:
-                main_weights = main_policy.get_weights()
-                opponent_policy.set_weights(main_weights)
-                result["custom_metrics"]["opponent_updated"] = 1.0
-            else:
-                result["custom_metrics"]["opponent_updated"] = 0.0
+            algorithm.config.policies_to_train = [self.active_policy_name]
+            
+            print(f"\n{'='*60}")
+            print(f"POLICY SWITCH - Iteration {self._update_counter}")
+            print(f"Aktive (trainierende) Policy: {self.active_policy_name}")
+            print(f"Eingefrorene Policy: {'policy_left' if self.active_policy_name == 'policy_right' else 'policy_right'}")
+            print(f"{'='*60}\n")
+            
+            result["custom_metrics"]["active_policy"] = self.active_policy_name
+
 
 def get_self_play_policy_mapping_fn(agent_id, episode, worker, **kwargs):
-    return "main_policy" if "left" in agent_id else "opponent_policy"
+    return "policy_left" if "left" in agent_id else "policy_right"
+
 
 def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
     config = ImpalaConfig()
@@ -179,15 +220,18 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
         enable_env_runner_and_connector_v2=False
     )
 
+    env_config = {
+        "debug_mode": debug_mode,
+        "representation": "extracted",
+        "env_name": "academy_pass_and_shoot_with_keeper",
+        "number_of_left_players_agent_controls": 1,
+        "number_of_right_players_agent_controls": 0,
+        "rewards": "scoring,checkpoints",
+    }
+
     config.environment(
         env="gfootball_multi",
-        env_config={
-            "debug_mode": debug_mode,
-            "env_name": "academy_pass_and_shoot_with_keeper",
-            "number_of_left_players_agent_controls": 1,
-            "number_of_right_players_agent_controls": 0,
-            "rewards": "scoring,checkpoints",
-        },
+        env_config=env_config,
         disable_env_checking=True,
     )
 
@@ -197,6 +241,7 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
         num_env_runners=0 if debug_mode else 6,
         num_envs_per_env_runner=2,
         gym_env_vectorize_mode="ASYNC",
+        create_env_on_local_worker=True,
         rollout_fragment_length=10 if debug_mode else 64,
         num_cpus_per_env_runner=1,
     )
@@ -214,21 +259,33 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
         lr=hyperparams["lr"],
         entropy_coeff=hyperparams["entropy_coeff"],
         vf_loss_coeff=hyperparams["vf_loss_coeff"],
-        train_batch_size=50 if debug_mode else 2048,
+        train_batch_size=128 if debug_mode else 16_384,
+        minibatch_size=32 if debug_mode else 2048,
         grad_clip=0.5,
-        model={
-            "framestack": False,
+        model = {
+            "framestack": True,
+            "conv_filters": [
+                [16, [3, 3], 1],
+                [16, [3, 3], 1],
+                [32, [3, 3], 2],
+                [32, [3, 3], 1],
+                [32, [3, 3], 1],
+                [64, [3, 3], 2],
+                [64, [3, 3], 1],
+                [64, [3, 3], 1],
+            ],
+            "conv_activation": "silu",
+            "use_attention": True,
+            "attention_num_transformer_units": 1,
+            "attention_dim": 128,
+            "attention_num_heads": 2,
+            "attention_head_dim": 64,
+            "attention_memory_inference": 32,
+            "attention_memory_training": 32,
+            "attention_position_wise_mlp_dim": 512,
+            "max_seq_len": 64,
             "fcnet_hiddens": [256, 256],
             "fcnet_activation": "silu",
-            "use_attention": True,
-            "attention_num_transformer_units": 2,
-            "attention_dim": 192,
-            "attention_num_heads": 3, 
-            "attention_head_dim": 64,
-            "attention_memory_inference": 64,
-            "attention_memory_training": 64,
-            "attention_position_wise_mlp_dim": 768,
-            "max_seq_len": 64,
         }
     )
 
@@ -242,13 +299,25 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
         num_gpus_per_learner=1/3,
         num_cpus_per_learner=1,
     )
+
+    has_left_agents = env_config["number_of_left_players_agent_controls"] > 0
+    has_right_agents = env_config["number_of_right_players_agent_controls"] > 0
+
+    policies = {}
+    policies_to_train = []
     
-    policies = {
-        "main_policy": PolicySpec(),
-        "opponent_policy": PolicySpec(),
-    }
+    if has_left_agents:
+        policies["policy_left"] = PolicySpec()
+        policies_to_train.append("policy_left")
     
-    policies_to_train = ["main_policy"]
+    if has_right_agents:
+        policies["policy_right"] = PolicySpec()
+        if not has_left_agents:
+            policies_to_train.append("policy_right")
+    
+
+    if has_left_agents and has_right_agents:
+        policies_to_train = ["policy_left"]
     
     config.multi_agent(
         policies=policies,
@@ -256,7 +325,13 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
         policies_to_train=policies_to_train,
     )
     
-    config.callbacks(lambda: SelfPlayCallback(update_interval=25))
+    config.callbacks(
+        lambda: SelfPlayCallback(
+            update_interval=25,
+            has_left_agents=has_left_agents,
+            has_right_agents=has_right_agents
+        )
+    )
     
     if not debug_mode:
         config.evaluation(
@@ -271,6 +346,7 @@ def create_impala_config(debug_mode: bool = False, hyperparams: dict = None) -> 
 
     return config
 
+
 def train():
     debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
     
@@ -281,18 +357,6 @@ def train():
     )
     
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
-    
-    pbt_scheduler = PopulationBasedTraining(
-        time_attr="timesteps_total",
-        metric="env_runners/episode_return_mean",
-        mode="max",
-        perturbation_interval=5_000_000,
-        hyperparam_mutations={
-            "lr": tune.loguniform(1e-5, 1e-3),
-            "entropy_coeff": tune.uniform(0.0, 0.02),
-            "vf_loss_coeff": tune.uniform(0.1, 1.0),
-        }
-    )
 
     param_space = create_impala_config(
         debug_mode=debug_mode,
@@ -318,13 +382,25 @@ def train():
         checkpoint_score_order="max",
         checkpoint_at_end=True,
     )
+
+    pbt_scheduler = PopulationBasedTraining(
+        time_attr="timesteps_total",
+        metric="env_runners/episode_return_mean",
+        mode="max",
+        perturbation_interval=102_400,
+        hyperparam_mutations={
+            "lr": tune.loguniform(1e-5, 1e-3),
+            "entropy_coeff": tune.uniform(0.0, 0.02),
+            "vf_loss_coeff": tune.uniform(0.1, 1.0),
+        }
+    )
     
     tuner = tune.Tuner(
         "IMPALA",
         param_space=param_space,
         tune_config=tune.TuneConfig(
             scheduler=pbt_scheduler,
-            num_samples=4,
+            num_samples=3,
         ),
         run_config=RunConfig( 
             stop=stop_criteria,

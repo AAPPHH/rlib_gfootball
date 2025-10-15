@@ -1,0 +1,50 @@
+import gfootball.env as football_env
+
+szenario_namen = [
+    "11_vs_11_stochastic",
+    "academy_empty_goal",
+    "academy_run_to_score",
+    "academy_pass_and_shoot_with_keeper",
+    "academy_3_vs_1_with_keeper",
+    "academy_corner",
+    "academy_counterattack_easy",
+]
+
+print(f"{'Szenario':<40} | {'Spieler Links':<15} | {'Spieler Rechts':<15}")
+print("-" * 75)
+
+for szenario in szenario_namen:
+    try:
+        env = football_env.create_environment(
+            env_name=szenario,
+            representation='simple115v2',
+            render=False
+        )
+
+        # Methode 1: Über die _env Attribute
+        if hasattr(env.unwrapped, '_env'):
+            game_env = env.unwrapped._env
+            if hasattr(game_env, '_config'):
+                config = game_env._config
+            else:
+                config = env.unwrapped._config
+        else:
+            config = env.unwrapped._config
+        
+        # Die richtigen Schlüssel sind 'players' für die linke Seite
+        # und die Gesamtanzahl kann über die Observation oder andere Attribute ermittelt werden
+        spieler_links = config.get('players', 'N/A')
+        
+        # Für die rechte Seite: Schaue nach 'right_team' oder anderen Konfigurationen
+        spieler_rechts = config.get('number_of_right_players_agent_controls', 0)
+        
+        # Alternative: Nutze die Observation Space Dimension
+        if spieler_links == 'N/A':
+            # Einige Szenarien haben 'number_of_left_players_agent_controls'
+            spieler_links = config.get('number_of_left_players_agent_controls', 1)
+        
+        print(f"{szenario:<40} | {spieler_links:<15} | {spieler_rechts:<15}")
+        
+        env.close()
+    except Exception as e:
+        print(f"Konnte Szenario '{szenario}' nicht laden: {e}")
