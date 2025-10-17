@@ -1,11 +1,10 @@
 import os
 from pathlib import Path
 import numpy as np
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any
 from datetime import datetime
 from dataclasses import dataclass
 
-import gymnasium as gym
 from gymnasium import spaces
 import gfootball.env as football_env
 
@@ -14,13 +13,10 @@ from ray import tune
 from ray.rllib.algorithms.impala import ImpalaConfig
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.policy.policy import PolicySpec
-from ray.rllib.utils.typing import MultiAgentDict
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune.schedulers import PopulationBasedTraining
-from ray.tune.callback import Callback
-
 
 @dataclass
 class TrainingStage:
@@ -34,11 +30,11 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic", "academy_pass_and_shoot_with_keeper", "extracted", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
-    TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "extracted", 1, 1, 0.75, 20_000_000, "1v1 Spiel"),
-    TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "extracted", 3, 3, 1.0, 50_000_000, "3v3 Kleinfeld"),
-    TrainingStage("stage_4_5v5", "11_vs_11_stochastic", "extracted", 5, 5, 1.0, 100_000_000, "5v5 Mittelfeld"),
-    TrainingStage("stage_5_11v11", "11_vs_11_stochastic", "extracted", 11, 11, 1.0, 500_000_000, "11v11 Vollspiel"),
+    # TrainingStage("stage_1_basic", "academy_pass_and_shoot_with_keeper", "extracted", 1, 0, 0.75, 1_000_000, "Two of our players try to score from the edge of the box, one is on the side with the ball, and next to a defender. The other is at the center, unmarked, and facing the opponent keeper."),
+    TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "extracted", 1, 1, 0.75, 20_000_000, "Three of our players try to score from the edge of the box, one on each side, and the other at the center. Initially, the player at the center has the ball and is facing the defender. There is an opponent keeper."),
+    TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "extracted", 3, 3, 1.0, 50_000_000, "A full 90 minutes football game (easy difficulty)"),
+    TrainingStage("stage_4_5v5", "11_vs_11_stochastic", "extracted", 5, 5, 1.0, 100_000_000, "A full 90 minutes football game (medium difficulty)"),
+    TrainingStage("stage_5_11v11", "11_vs_11_stochastic", "extracted", 11, 11, 1.0, 500_000_000, "A full 90 minutes football game (medium difficulty)"),
 ]
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
@@ -71,17 +67,18 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         reset_result = self.env.reset()
         test_obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         
-        if not self.agent_ids: single_obs_shape = test_obs.shape
-        elif len(test_obs.shape) > 1: single_obs_shape = test_obs[0].shape
+        if not self.agent_ids:
+            single_obs_shape = test_obs.shape
+        elif len(test_obs.shape) > 1:
+            single_obs_shape = test_obs[0].shape
         else:
             assert test_obs.shape[0] % len(self.agent_ids) == 0
             single_obs_shape = (test_obs.shape[0] // len(self.agent_ids),)
 
-        self.observation_space = spaces.Dict({
-            agent_id: spaces.Box(low=-np.inf, high=np.inf, shape=single_obs_shape, dtype=np.float32)
-            for agent_id in self.agent_ids})
-        self.action_space = spaces.Dict({
-            agent_id: spaces.Discrete(19) for agent_id in self.agent_ids})
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=single_obs_shape, dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(19)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed, options=options)
@@ -120,23 +117,15 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
 
     def close(self): self.env.close()
 
-class RestoreCheckpointCallback(Callback):
-    def __init__(self, checkpoint_path: str):
-        super().__init__()
-        self.checkpoint_path = checkpoint_path
-
-    def on_trial_start(self, iteration: int, trials: list, trial, **info):
-        print(f"Trial {trial.trial_id} loading weights from: {self.checkpoint_path}")
-        trial.get_trainable().restore(self.checkpoint_path)
-
 def get_policy_mapping_fn(agent_id, episode, worker, **kwargs):
     return "policy_left" if "left" in agent_id else "policy_right"
-
-def select_policy_to_train(algorithm, train_batch, **kwargs):
-    """Dynamically selects which policy to train based on the callback's state."""
-    metrics = algorithm.get_local_worker().get_metrics()
-    active_policy = metrics.get("custom_metrics", {}).get("active_policy", "policy_left")
-    return [active_policy]
+    
+def select_policy_to_train(policy_id, worker, **kwargs):
+    if hasattr(worker, 'get_metrics'):
+        metrics = worker.get_metrics()
+        active_policy = metrics.get("custom_metrics", {}).get("active_policy", "policy_left")
+        return policy_id == active_policy
+    return True
 
 class SelfPlayCallback(DefaultCallbacks):
     def __init__(self, update_interval=25, has_left_agents=True, has_right_agents=True):
@@ -147,7 +136,7 @@ class SelfPlayCallback(DefaultCallbacks):
         self.active_policy_name = "policy_left"
 
     def on_train_result(self, *, algorithm, result: dict, **kwargs):
-        if self.self_play_enabled and self._update_counter % self.update_interval == 0:
+        if self.self_play_enabled and self._update_counter > 0 and self._update_counter % self.update_interval == 0:
             self.active_policy_name = "policy_right" if self.active_policy_name == "policy_left" else "policy_left"
             print(f"\n--- Active training policy will switch to: {self.active_policy_name} for the next iterations ---")
         
@@ -165,7 +154,6 @@ class SelfPlayCallback(DefaultCallbacks):
 
 def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperparams: dict = None) -> ImpalaConfig:
     config = ImpalaConfig()
-    config.api_stack(enable_rl_module_and_learner=False, enable_env_runner_and_connector_v2=False)
     
     env_config = {
         "debug_mode": debug_mode, "representation": stage.representation, "env_name": stage.env_name,
@@ -173,11 +161,11 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperpa
         "number_of_right_players_agent_controls": stage.right_players,
         "rewards": "scoring,checkpoints",
     }
-    config.environment("gfootball_multi", env_config=env_config, disable_env_checking=True)
+    config.environment("gfootball_multi", env_config=env_config)
     config.framework("torch")
-    config.env_runners(num_env_runners=0 if debug_mode else 7, num_envs_per_env_runner=2,
-                     rollout_fragment_length=10 if debug_mode else 64)
-    config.fault_tolerance(restart_failed_env_runners=True)
+    config.env_runners(num_env_runners=0 if debug_mode else 3, num_envs_per_env_runner=1,
+                   num_cpus_per_env_runner=3,
+                   rollout_fragment_length=10 if debug_mode else 16)
     
     if hyperparams is None:
         hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
@@ -185,41 +173,39 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperpa
     model_config = {
         "framestack": True,
         "conv_filters": [
-            [32, [3, 3], 2], [32, [3, 3], 1],
-            [64, [3, 3], 2], [64, [3, 3], 1],
-            [128, [3, 3], 2], [128, [3, 3], 1],
+            [8, [3, 3], 2], [8, [3, 3], 1],
+            [16, [3, 3], 2], [16, [3, 3], 1]
         ],
         "conv_activation": "silu",
         "use_attention": True,
-        "attention_num_transformer_units": 3,   # +1 Block
-        "attention_dim": 256,                   # 4*64
-        "attention_num_heads": 4,
-        "attention_head_dim": 64,
-        "attention_memory_inference": 64,
-        "attention_memory_training": 64,
-        "attention_position_wise_mlp_dim": 1024,
-        "max_seq_len": 64,
-        "fcnet_hiddens": [512, 512],
-        "fcnet_activation": "silu",
+        "attention_num_transformer_units": 1,
+        "attention_dim": 64,
+        "attention_num_heads": 2,
+        "attention_head_dim": 16,
+        "attention_memory_inference": 16,
+        "attention_memory_training": 16,
+        "attention_position_wise_mlp_dim": 128,
+        "max_seq_len": 16,
+        "fcnet_hiddens": [128],
+        "fcnet_activation": "silu"
     }
-
-
 
     config.training(
         lr=hyperparams["lr"], 
         entropy_coeff=hyperparams["entropy_coeff"],
         vf_loss_coeff=hyperparams["vf_loss_coeff"], 
         grad_clip=0.5,
-        train_batch_size=8192 if not debug_mode else 128,
-        minibatch_size=1024 if not debug_mode else 128,
-        model=model_config
+        train_batch_size=128 if not debug_mode else 16,
+        model=model_config,
+        learner_queue_size=1,
     )
 
-    config.resources(num_gpus=1/3, num_cpus_for_main_process=1)
-    config.learners(num_learners=1, num_gpus_per_learner=1/3, num_cpus_per_learner=1)
+    config.resources(num_gpus=1/2, num_cpus_for_main_process=3)
+    config.learners(num_learners=1, num_gpus_per_learner=1/2, num_cpus_per_learner=1)
 
     policies = {}
     has_left, has_right = stage.left_players > 0, stage.right_players > 0
+
     if has_left: policies["policy_left"] = PolicySpec()
     if has_right: policies["policy_right"] = PolicySpec()
         
@@ -236,9 +222,14 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False, hyperpa
         policy_mapping_fn=get_policy_mapping_fn, 
         policies_to_train=policies_to_train_fn
     )
+
     config.callbacks(lambda: SelfPlayCallback(25, has_left, has_right))
     config.debugging(seed=42, log_level="WARN")
     return config
+
+def short_trial_name_creator(trial):
+    """ Erstellt einen kurzen, eindeutigen Ordnernamen für einen Trial. """
+    return trial.trial_id
 
 def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
     print("\n" + "="*80)
@@ -259,19 +250,23 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
         }
     ).to_dict()
 
+    if restore_checkpoint:
+        param_space["_restore_checkpoint_path"] = restore_checkpoint
+
+    metric_path = "env_runners/episode_return_mean"
     stop_criteria = {
-        "env_runners/episode_return_mean": stage.target_reward,
+        # metric_path: stage.target_reward,
         "timesteps_total": stage.max_timesteps,
     }
     
     checkpoint_config = CheckpointConfig(
-        num_to_keep=3, checkpoint_frequency=50,
-        checkpoint_score_attribute="env_runners/episode_return_mean",
+        num_to_keep=None, checkpoint_frequency=50,
+        checkpoint_score_attribute=metric_path,
         checkpoint_score_order="max", checkpoint_at_end=True,
     )
     
     pbt_scheduler = PopulationBasedTraining(
-        time_attr="timesteps_total", metric="env_runners/episode_return_mean",
+        time_attr="timesteps_total", metric=metric_path,
         mode="max", perturbation_interval=128_000,
         hyperparam_mutations={
             "lr": tune.loguniform(1e-5, 1e-3),
@@ -279,26 +274,34 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
             "vf_loss_coeff": tune.uniform(0.1, 1.0),
         }
     )
-    
-    run_callbacks = []
-    if restore_checkpoint:
-        run_callbacks.append(RestoreCheckpointCallback(checkpoint_path=restore_checkpoint))
 
     tuner = tune.Tuner(
         "IMPALA",
         param_space=param_space,
-        tune_config=tune.TuneConfig(scheduler=pbt_scheduler, num_samples=3),
+        tune_config=tune.TuneConfig(
+            scheduler=pbt_scheduler, 
+            num_samples=2,
+            trial_dirname_creator=short_trial_name_creator
+        ),
         run_config=RunConfig(
             stop=stop_criteria,
             checkpoint_config=checkpoint_config,
             name=f"{stage.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             storage_path=str(results_path),
-            callbacks=run_callbacks
         ),
     )
     
     results = tuner.fit()
-    best_result = results.get_best_result(metric="env_runners/episode_return_mean", mode="max")
+    if results.experiment_path:
+        experiment_path = str(results.experiment_path)
+        log_file = results_path / "tensorboard_commands.txt"
+        tensorboard_command = f"tensorboard --logdir \"{experiment_path}\""
+        
+        with open(log_file, "a") as f:
+            f.write(f"--- Stage: {stage.name} ---\n")
+            f.write(f"{tensorboard_command}\n\n")
+        
+    best_result = results.get_best_result(metric=metric_path, mode="max")
     
     if best_result and best_result.checkpoint:
         checkpoint_path = str(best_result.checkpoint.path)
@@ -339,7 +342,7 @@ def main():
     start_stage = int(os.environ.get("GFOOTBALL_START_STAGE", "0"))
     end_stage_env = os.environ.get("GFOOTBALL_END_STAGE", "")
     end_stage = int(end_stage_env) if end_stage_env else None
-    initial_checkpoint = os.environ.get("GFOOTBALL_CHECKPOINT", None)
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_2_1v1_20251017_081406\7c59c_00001\checkpoint_000041"
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
