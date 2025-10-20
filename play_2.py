@@ -368,9 +368,9 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
 
 if __name__ == "__main__":
     
-    USE_RANDOM_WEIGHTS = False 
-    CHECKPOINT_PFAD = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_1_20251019_191114\9e3b0_00000\checkpoint_000095"
-    STAGE_KEY = "s3_pass_shoot"
+    USE_RANDOM_WEIGHTS = True 
+    CHECKPOINT_PFAD = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_1_20251019_191114\9e3b0_00001\checkpoint_000086"
+    STAGE_KEY = "s2_run_to_score"
     NUM_EPISODEN = 5
 
     if USE_RANDOM_WEIGHTS:
