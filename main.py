@@ -23,6 +23,7 @@ from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune.schedulers import PopulationBasedTraining
 from ray.rllib.models import ModelCatalog
 from model import GFootballMamba
+
 @dataclass
 class TrainingStage:
     name: str
@@ -645,8 +646,6 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
     if hyperparams is None:
         hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
 
-
-
     config.training(
             lr=hyperparams["lr"],
             entropy_coeff=hyperparams["entropy_coeff"],
@@ -656,7 +655,7 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
             learner_queue_size=1,
         )
     
-    use_custom_model = True
+    use_custom_model = False
     custom_model_config = {
             "custom_model": "GFootballMamba",
             "custom_model_config": {
@@ -838,9 +837,9 @@ def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
 def main():
     debug_mode = False
     use_transfer = True
-    start_stage = 0
+    start_stage = 1
     end_stage = 8
-    initial_checkpoint = None
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_20251020_165600\e4560_00001\checkpoint_000008"
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
