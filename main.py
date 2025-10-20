@@ -35,7 +35,7 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic_0", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler vor Tor"),
+    TrainingStage("stage_1_basic_0", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 5_000_000, "1 Spieler vor Tor"),
     TrainingStage("stage_1_basic_1", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler rennt zum Tor"),
     TrainingStage("stage_1_basic_2", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
     TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 20_000_000, "1v1"),
@@ -644,27 +644,41 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
     if hyperparams is None:
         hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
 
+
+
     config.training(
-        lr=hyperparams["lr"],
-        entropy_coeff=hyperparams["entropy_coeff"],
-        vf_loss_coeff=hyperparams["vf_loss_coeff"],
-        grad_clip=0.5,
-        train_batch_size=1024 if not debug_mode else 8,
-        learner_queue_size=1,
-    )
-    model_config_dict = {
-        "custom_model": "GFootballMamba",
-        "custom_model_config": {
-            "d_model": 96,
-            "num_layers": 2,
-            "d_state": 8,
+            lr=hyperparams["lr"],
+            entropy_coeff=hyperparams["entropy_coeff"],
+            vf_loss_coeff=hyperparams["vf_loss_coeff"],
+            grad_clip=0.5,
+            train_batch_size=1024 if not debug_mode else 8,
+            learner_queue_size=1,
+        )
+    
+    use_custom_model = False
+    custom_model_config = {
+            "custom_model": "GFootballMamba",
+            "custom_model_config": {
+            "d_model": 128,
+            "num_layers": 5,
+            "d_state": 16,
             "d_conv": 3,
             "expand": 2,
             "dropout": 0.05,
-            "use_amp": True
         }
     }
-    config.model.update(model_config_dict)
+    
+    standard_model_config = {
+        "fcnet_hiddens": [256, 256],
+        "lstm_cell_size": 256,
+    }
+
+    if use_custom_model:
+        print("--- Using CUSTOM model: GFootballMamba ---")
+        config.model.update(custom_model_config)
+    else:
+        print("--- Using STANDARD model: IMPALA CNN+LSTM ---")
+        config.model.update(standard_model_config)
 
     config.resources(num_gpus=1/2, num_cpus_for_main_process=2)
     config.learners(num_learners=1, num_gpus_per_learner=1/2, num_cpus_per_learner=1)
