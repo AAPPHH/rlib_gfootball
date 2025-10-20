@@ -22,8 +22,7 @@ from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune.schedulers import PopulationBasedTraining
 from ray.rllib.models import ModelCatalog
-from model import GFootballMambaHybrid2025, GFootballMambaLite2025
-
+from model import GFootballMamba
 @dataclass
 class TrainingStage:
     name: str
@@ -38,7 +37,7 @@ class TrainingStage:
 TRAINING_STAGES = [
     TrainingStage("stage_1_basic_0", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler vor Tor"),
     TrainingStage("stage_1_basic_1", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler rennt zum Tor"),
-    TrainingStage("stage_1_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
+    TrainingStage("stage_1_basic_2", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
     TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 20_000_000, "1v1"),
     TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 0, 1.0, 50_000_000, "3v3"),
     TrainingStage("stage_4_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "3v3"),
@@ -645,27 +644,27 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
     if hyperparams is None:
         hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
 
-    model_config = {
-        "custom_model": "mamba_hybrid_2025",  # oder "mamba_lite_2025"
-        "custom_model_config": {
-            "d_model": 256,              # Modell-Dimension
-            "num_layers": 4,              # Anzahl Hybrid-Blocks (2-6)
-            "d_state": 16,                # SSM state size (8-32)
-            "num_heads": 4,               # Attention heads
-            "use_attention": True,        # Hybrid Mamba+Attention
-            "dropout": 0.1,
-            "use_amp": True,
-        }
-    }
     config.training(
-        lr=hyperparams["lr"], 
+        lr=hyperparams["lr"],
         entropy_coeff=hyperparams["entropy_coeff"],
-        vf_loss_coeff=hyperparams["vf_loss_coeff"], 
+        vf_loss_coeff=hyperparams["vf_loss_coeff"],
         grad_clip=0.5,
-        train_batch_size=4096 if not debug_mode else 8,
-        model=model_config,
+        train_batch_size=1024 if not debug_mode else 8,
         learner_queue_size=1,
     )
+    model_config_dict = {
+        "custom_model": "GFootballMamba",
+        "custom_model_config": {
+            "d_model": 96,
+            "num_layers": 2,
+            "d_state": 8,
+            "d_conv": 3,
+            "expand": 2,
+            "dropout": 0.05,
+            "use_amp": True
+        }
+    }
+    config.model.update(model_config_dict)
 
     config.resources(num_gpus=1/2, num_cpus_for_main_process=2)
     config.learners(num_learners=1, num_gpus_per_learner=1/2, num_cpus_per_learner=1)
@@ -771,6 +770,7 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
             stop=stop_criteria,
             checkpoint_config=checkpoint_config,
             name=f"{stage.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            # name="stage_1_basic_1_20251019_191114",
             storage_path=str(results_path),
         ),
     )
@@ -821,17 +821,16 @@ def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
     print("="*80 + "\n")
 
 def main():
-    debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
-    use_transfer = os.environ.get("GFOOTBALL_TRANSFER", "true").lower() == "true"
+    debug_mode = False
+    use_transfer = True
     start_stage = 1
-    end_stage_env = os.environ.get("GFOOTBALL_END_STAGE", "")
-    end_stage = int(end_stage_env) if end_stage_env else None
-    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_0_20251019_183620\be36f_00001\checkpoint_000004"
+    end_stage = 5
+    initial_checkpoint = None
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
-    ModelCatalog.register_custom_model("mamba_hybrid_2025", GFootballMambaHybrid2025)
-    ModelCatalog.register_custom_model("mamba_lite_2025", GFootballMambaLite2025)
+    ModelCatalog.register_custom_model("GFootballMamba", GFootballMamba)
+
 
     if use_transfer:
         train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint)
@@ -840,7 +839,6 @@ def main():
         train_single_stage(stage, start_stage, debug_mode, initial_checkpoint)
     
     ray.shutdown()
-
 
 if __name__ == "__main__":
     main()
