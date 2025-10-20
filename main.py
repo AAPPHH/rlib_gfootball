@@ -21,12 +21,14 @@ from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.tune.registry import register_env
 from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune.schedulers import PopulationBasedTraining
+from ray.rllib.models import ModelCatalog
+from model import GFootballMambaHybrid2025, GFootballMambaLite2025
 
 @dataclass
 class TrainingStage:
     name: str
     env_name: str
-    representation: str
+    representation: str 
     left_players: int
     right_players: int
     target_reward: float
@@ -34,7 +36,13 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_5_11v11", "11_vs_11_stochastic", "extracted", 11, 11, 1.0, 500_000_000, "A full 90 minutes football game (medium difficulty)"),
+    TrainingStage("stage_1_basic_0", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler vor Tor"),
+    TrainingStage("stage_1_basic_1", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler rennt zum Tor"),
+    TrainingStage("stage_1_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
+    TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 20_000_000, "1v1"),
+    TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 0, 1.0, 50_000_000, "3v3"),
+    TrainingStage("stage_4_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "3v3"),
+    TrainingStage("stage_5_3v3", "11_vs_11_stochastic", "simple115v2", 3, 3, 1.0, 500_000_000, "3v3"),
 ]
 
 class PolicyPool:
@@ -439,8 +447,8 @@ class EnhancedSelfPlayCallback(DefaultCallbacks):
         right_rewards = [r for aid, r in agent_rewards.items() if "right" in aid]
         
         if left_rewards and right_rewards:
-            left_total = sum(left_rewards)
-            right_total = sum(right_rewards)
+            left_total = sum(left_rewards) / len(left_rewards) if left_rewards else 0.0
+            right_total = sum(right_rewards) / len(right_rewards) if right_rewards else 0.0
             
             self.accumulated_left_score += left_total
             self.accumulated_right_score += right_total
@@ -630,41 +638,31 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
     }
     config.environment("gfootball_multi", env_config=env_config)
     config.framework("torch")
-    config.env_runners(num_env_runners=0 if debug_mode else 1, num_envs_per_env_runner=3,
-                       num_cpus_per_env_runner=10,
-                       rollout_fragment_length=10 if debug_mode else 4)
+    config.env_runners(num_env_runners=0 if debug_mode else 5, num_envs_per_env_runner=1,
+                       num_cpus_per_env_runner=2,
+                       rollout_fragment_length=8 if debug_mode else 8)
     
     if hyperparams is None:
         hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
 
     model_config = {
-        "framestack": True,
-        "conv_filters": [
-            [4, [3, 3], 2], [4, [3, 3], 1],
-            [6, [3, 3], 2], [6, [3, 3], 1],
-        ],
-        "conv_activation": "silu",
-
-        "use_attention": True,
-        "attention_num_transformer_units": 1,
-        "attention_dim": 24,
-        "attention_num_heads": 2,
-        "attention_head_dim": 8,
-        "attention_memory_inference": 4,
-        "attention_memory_training": 4,
-        "attention_position_wise_mlp_dim": 48,
-        "max_seq_len": 4,
-
-        "fcnet_hiddens": [48],
-        "fcnet_activation": "silu",
+        "custom_model": "mamba_hybrid_2025",  # oder "mamba_lite_2025"
+        "custom_model_config": {
+            "d_model": 256,              # Modell-Dimension
+            "num_layers": 4,              # Anzahl Hybrid-Blocks (2-6)
+            "d_state": 16,                # SSM state size (8-32)
+            "num_heads": 4,               # Attention heads
+            "use_attention": True,        # Hybrid Mamba+Attention
+            "dropout": 0.1,
+            "use_amp": True,
+        }
     }
-
     config.training(
         lr=hyperparams["lr"], 
         entropy_coeff=hyperparams["entropy_coeff"],
         vf_loss_coeff=hyperparams["vf_loss_coeff"], 
         grad_clip=0.5,
-        train_batch_size=128 if not debug_mode else 8,
+        train_batch_size=4096 if not debug_mode else 8,
         model=model_config,
         learner_queue_size=1,
     )
@@ -693,12 +691,12 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
     )
 
     config.callbacks(lambda: EnhancedSelfPlayCallback(
-        update_interval=10, 
-        version_save_interval=2,
+        update_interval=50, 
+        version_save_interval=50,
         has_left_agents=has_left, 
         has_right_agents=has_right,
         save_dir=policy_pool_dir,
-        min_games_before_rating_update=5,
+        min_games_before_rating_update=20,
         max_versions_per_policy=max_versions,
         keep_top_n=keep_top,
         active_zone_size=active_zone,
@@ -730,7 +728,7 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
             "vf_loss_coeff": tune.choice([0.4, 0.5, 0.6]),
         },
         policy_pool_dir=str(policy_pool_dir),
-        max_versions=50,
+        max_versions=25,
         keep_top=10,
         active_zone=15,
         auto_prune=True
@@ -752,7 +750,7 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
     
     pbt_scheduler = PopulationBasedTraining(
         time_attr="timesteps_total", metric=metric_path,
-        mode="max", perturbation_interval=128_000,
+        mode="max", perturbation_interval=64_000,
         hyperparam_mutations={
             "lr": tune.loguniform(1e-5, 1e-3),
             "entropy_coeff": tune.uniform(0.0, 0.02),
@@ -766,6 +764,7 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
         tune_config=tune.TuneConfig(
             scheduler=pbt_scheduler, 
             num_samples=2,
+            max_concurrent_trials=2,
             trial_dirname_creator=short_trial_name_creator
         ),
         run_config=RunConfig(
@@ -824,14 +823,16 @@ def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
 def main():
     debug_mode = os.environ.get("GFOOTBALL_DEBUG", "").lower() == "true"
     use_transfer = os.environ.get("GFOOTBALL_TRANSFER", "true").lower() == "true"
-    start_stage = int(os.environ.get("GFOOTBALL_START_STAGE", "0"))
+    start_stage = 1
     end_stage_env = os.environ.get("GFOOTBALL_END_STAGE", "")
     end_stage = int(end_stage_env) if end_stage_env else None
-    initial_checkpoint = r"C:\clones\rlib_gfootball\stage_3_3v3_20251017_232001_save\0ade1_00001\checkpoint_000077"
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_0_20251019_183620\be36f_00001\checkpoint_000004"
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
-    
+    ModelCatalog.register_custom_model("mamba_hybrid_2025", GFootballMambaHybrid2025)
+    ModelCatalog.register_custom_model("mamba_lite_2025", GFootballMambaLite2025)
+
     if use_transfer:
         train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint)
     else:

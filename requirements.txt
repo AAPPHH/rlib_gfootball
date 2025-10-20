@@ -1,8 +1,8 @@
 
-ray[rllib]
+ray[rllib]=2.3
 
 gfootball
 
-gymnasium
+gymnasium=0.22
 
 numpy
