@@ -21,7 +21,6 @@ for szenario in szenario_namen:
             render=False
         )
 
-        # Methode 1: Über die _env Attribute
         if hasattr(env.unwrapped, '_env'):
             game_env = env.unwrapped._env
             if hasattr(game_env, '_config'):
@@ -31,16 +30,12 @@ for szenario in szenario_namen:
         else:
             config = env.unwrapped._config
         
-        # Die richtigen Schlüssel sind 'players' für die linke Seite
-        # und die Gesamtanzahl kann über die Observation oder andere Attribute ermittelt werden
+
         spieler_links = config.get('players', 'N/A')
         
-        # Für die rechte Seite: Schaue nach 'right_team' oder anderen Konfigurationen
         spieler_rechts = config.get('number_of_right_players_agent_controls', 0)
         
-        # Alternative: Nutze die Observation Space Dimension
         if spieler_links == 'N/A':
-            # Einige Szenarien haben 'number_of_left_players_agent_controls'
             spieler_links = config.get('number_of_left_players_agent_controls', 1)
         
         print(f"{szenario:<40} | {spieler_links:<15} | {spieler_rechts:<15}")
