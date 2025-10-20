@@ -35,13 +35,14 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic_0", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 5_000_000, "1 Spieler vor Tor"),
-    TrainingStage("stage_1_basic_1", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler rennt zum Tor"),
-    TrainingStage("stage_1_basic_2", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 Spieler gegen Keeper"),
-    TrainingStage("stage_2_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 20_000_000, "1v1"),
-    TrainingStage("stage_3_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 0, 1.0, 50_000_000, "3v3"),
-    TrainingStage("stage_4_3v3", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "3v3"),
-    TrainingStage("stage_5_3v3", "11_vs_11_stochastic", "simple115v2", 3, 3, 1.0, 500_000_000, "3v3"),
+    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
+    TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 1, 0.75, 20_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
+    TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 3, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 0, 1.0, 50_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
+    TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
+    TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 3, 3, 1.0, 500_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
 ]
 
 class PolicyPool:
@@ -655,7 +656,7 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
             learner_queue_size=1,
         )
     
-    use_custom_model = False
+    use_custom_model = True
     custom_model_config = {
             "custom_model": "GFootballMamba",
             "custom_model_config": {
@@ -837,8 +838,8 @@ def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
 def main():
     debug_mode = False
     use_transfer = True
-    start_stage = 1
-    end_stage = 5
+    start_stage = 0
+    end_stage = 8
     initial_checkpoint = None
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
