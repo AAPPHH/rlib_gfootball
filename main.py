@@ -32,11 +32,11 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
     # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    # TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
     # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
     # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
     # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
@@ -122,7 +122,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
 
     def close(self): self.env.close()
 
-
 def get_policy_mapping_fn(agent_id, episode, worker, **kwargs):
     return "policy_left" if "left" in agent_id else "policy_right"
 
@@ -174,12 +173,13 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
             "custom_model": "GFootballMamba",
             "custom_model_config": {
             "d_model": 128,
-            "num_layers": 4,
+            "num_layers": 3,
             "d_state": 16,
             "d_conv": 3,
             "expand": 2,
             "dropout": 0.03,
-
+            "use_amp": True,
+            "gradient_checkpointing": True 
         }
     }
     
@@ -246,16 +246,21 @@ def train_impala_with_restore(config):
 
     algo = Impala(config=config)
 
+    last_reported_checkpoint = None
+    
     start_timesteps = 0
     if restore_path:
         print(f"🔄 [Trainer Fn] Restoring from: {restore_path}")
         try:
             algo.restore(restore_path)
             start_timesteps = algo._counters.get("num_env_steps_sampled", 0)
+            
+            last_reported_checkpoint = Checkpoint.from_directory(restore_path)
+            
             print(f"📊 [Trainer Fn] Successfully restored. Starting from timestep: {start_timesteps}")
         except Exception as e:
             print(f"⚠️ [Trainer Fn] ERROR restoring {restore_path}: {e}. Starting fresh.")
-    
+            
     timesteps = start_timesteps
     iteration = 0
 
@@ -267,16 +272,18 @@ def train_impala_with_restore(config):
         if iteration % checkpoint_freq == 0:
             save_result = algo.save()
             chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-            checkpoint = Checkpoint.from_directory(chk_path)
-            train.report(metrics=result, checkpoint=checkpoint)
+            
+            last_reported_checkpoint = Checkpoint.from_directory(chk_path)
+            train.report(metrics=result, checkpoint=last_reported_checkpoint)
         else:
-            train.report(metrics=result)
+            train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
     save_result = algo.save()
     chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-    checkpoint = Checkpoint.from_directory(chk_path)
+    last_reported_checkpoint = Checkpoint.from_directory(chk_path)
+    
     print(f"✅ [Trainer Fn] Complete: {start_timesteps} → {timesteps} timesteps")
-    train.report(metrics=result, checkpoint=checkpoint)
+    train.report(metrics=result, checkpoint=last_reported_checkpoint)
     
     algo.stop()
 
@@ -413,8 +420,8 @@ def main():
     debug_mode = False
     use_transfer = True
     start_stage = 0
-    end_stage = 8
-    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt_21\stage_1_basic_20251020_183644\f71c1_00000\checkpoint_000003"
+    end_stage = 0
+    initial_checkpoint = None
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     print(ray.cluster_resources())
