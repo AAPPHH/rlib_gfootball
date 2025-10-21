@@ -32,8 +32,8 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
     # TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
@@ -179,6 +179,7 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
             "d_conv": 3,
             "expand": 2,
             "dropout": 0.03,
+
         }
     }
     
