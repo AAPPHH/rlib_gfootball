@@ -1,23 +1,23 @@
-from pathlib import Path
-import numpy as np
-from typing import Dict, Any
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict
 
-from gymnasium import spaces
 import gfootball.env as football_env
-
+import numpy as np
 import ray
-from ray import tune
-from ray.rllib.algorithms.impala import ImpalaConfig
+from gymnasium import spaces
+from ray import train, tune
+from ray.air.config import CheckpointConfig, RunConfig
+from ray.rllib.algorithms.impala import Impala, ImpalaConfig
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
-from ray.rllib.policy.policy import PolicySpec
-from ray.tune.registry import register_env
-from ray.air.config import RunConfig, CheckpointConfig
-from ray.tune.schedulers import PopulationBasedTraining
 from ray.rllib.models import ModelCatalog
-from model import GFootballMamba
+from ray.rllib.policy.policy import PolicySpec
+from ray.train import Checkpoint
+from ray.tune.registry import register_env
+from ray.tune.schedulers import PopulationBasedTraining
 
+from model import GFootballMamba
 from policy_pool import EnhancedSelfPlayCallback
 
 @dataclass
@@ -32,14 +32,14 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
-    TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 10_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
-    TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 20_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
-    TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 50_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
-    TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 100_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
-    TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
+    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
+    # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
+    # TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
+    # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
+    # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
 ]
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
@@ -169,16 +169,16 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
             learner_queue_size=1,
         )
     
-    use_custom_model = False
+    use_custom_model = True
     custom_model_config = {
             "custom_model": "GFootballMamba",
             "custom_model_config": {
             "d_model": 128,
-            "num_layers": 5,
+            "num_layers": 4,
             "d_state": 16,
             "d_conv": 3,
             "expand": 2,
-            "dropout": 0.05,
+            "dropout": 0.03,
         }
     }
     
@@ -210,7 +210,7 @@ def create_impala_config(stage: TrainingStage, debug_mode: bool = False,
         policies_to_train_fn = ["policy_left"]
     elif has_right:
         policies_to_train_fn = ["policy_right"]
-    else: # 0v0 scenario (shouldn't happen in training)
+    else: 
         policies_to_train_fn = []
     
     config.multi_agent(
@@ -239,14 +239,6 @@ def short_trial_name_creator(trial):
     return trial.trial_id
 
 def train_impala_with_restore(config):
-    """
-    Diese Funktion ist zwingend notwendig.
-    Sie erstellt den Impala-Algo und LÄDT den Checkpoint manuell.
-    """
-    from ray import train
-    from ray.train import Checkpoint
-    from ray.rllib.algorithms.impala import Impala
-
     restore_path = config.pop("_restore_from", None)
     stop_timesteps = config.pop("_stop_timesteps", 1_000_000)
     checkpoint_freq = 50
@@ -300,10 +292,10 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
     param_space = create_impala_config(
         stage=stage,
         debug_mode=debug_mode,
-        hyperparams={
-            "lr": tune.choice([0.0005, 0.0003, 0.0001]),
-            "entropy_coeff": tune.choice([0.006, 0.008, 0.01]),
-            "vf_loss_coeff": tune.choice([0.4, 0.5, 0.6]),
+        hyperparams = {
+            "lr": tune.choice([0.0001, 0.0003, 0.0005]),
+            "entropy_coeff": tune.choice([0.004, 0.006, 0.01]),
+            "vf_loss_coeff": tune.choice([0.6, 0.8, 1.0]),
         },
         policy_pool_dir=str(policy_pool_dir),
         max_versions=25,
@@ -312,10 +304,8 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
         auto_prune=True
     ).to_dict()
 
-    # --- ZWINGENDE ÄNDERUNG (1): Parameter für die neue Funktion ---
     param_space["_stop_timesteps"] = stage.max_timesteps
     if restore_checkpoint:
-        # Der Key MUSS geändert werden, da `_restore_checkpoint_path` FALSCH war.
         param_space["_restore_from"] = restore_checkpoint 
 
     metric_path = "env_runners/episode_return_mean"
@@ -323,12 +313,12 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
 
     num_runners = 0 if debug_mode else 5
     cpus_per_runner = 2
-    gpus_for_learner = 0.5 # (von num_gpus=1/2)
-    cpus_for_learner_and_driver = 2 # (von num_cpus_for_main_process=2)
+    gpus_for_learner = 0.5
+    cpus_for_learner_and_driver = 2
 
     resources = tune.PlacementGroupFactory(
-        [{"CPU": cpus_for_learner_and_driver, "GPU": gpus_for_learner}] + # Driver/Learner
-        [{"CPU": cpus_per_runner}] * num_runners  # Env runners
+        [{"CPU": cpus_for_learner_and_driver, "GPU": gpus_for_learner}] +
+        [{"CPU": cpus_per_runner}] * num_runners
     )
 
     stop_criteria = {
@@ -340,7 +330,6 @@ def train_single_stage(stage, stage_index, debug_mode, restore_checkpoint):
         checkpoint_frequency=0,
         checkpoint_score_attribute=metric_path,
         checkpoint_score_order="max",
-        checkpoint_at_end=False # KORRIGIERT (war True und hat Fehler verursacht)
     )
     
     pbt_scheduler = PopulationBasedTraining(
@@ -422,14 +411,13 @@ def train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint):
 def main():
     debug_mode = False
     use_transfer = True
-    start_stage = 1
+    start_stage = 0
     end_stage = 8
-    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_20251020_165600\e4560_00001\checkpoint_000008"
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt_21\stage_1_basic_20251020_183644\f71c1_00000\checkpoint_000003"
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
     ModelCatalog.register_custom_model("GFootballMamba", GFootballMamba)
-
 
     if use_transfer:
         train_progressive(start_stage, end_stage, debug_mode, initial_checkpoint)
@@ -440,4 +428,4 @@ def main():
     ray.shutdown()
 
 if __name__ == "__main__":
-    main()
+    main() 

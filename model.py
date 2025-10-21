@@ -7,7 +7,7 @@ from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models.torch.misc import normc_initializer
 from ray.rllib.utils.typing import Dict, TensorType, List, ModelConfigDict
 from gymnasium.spaces import Space
-from typing import Optional, Tuple
+from typing import Tuple
 
 
 class SelectiveSSM(nn.Module):
@@ -90,7 +90,7 @@ class ImprovedMambaBlock(nn.Module):
         x_out = x_ssm * F.silu(gate_branch)
         x_out = self.out_proj(x_out)
         
-        return residual + x_out
+        return residual + 0.5 * x_out
 
 
 class GFootballMamba(TorchModelV2, nn.Module):
