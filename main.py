@@ -416,6 +416,8 @@ def main():
     initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_pbt_21\stage_1_basic_20251020_183644\f71c1_00000\checkpoint_000003"
     
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
+    print(ray.cluster_resources())
+    
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
     ModelCatalog.register_custom_model("GFootballMamba", GFootballMamba)
 
