@@ -19,7 +19,7 @@ from ray.train import Checkpoint
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
 
-from model import GFootballMamba
+from model import GFootballTCN
 from policy_pool import EnhancedSelfPlayCallback
 
 @dataclass
@@ -32,9 +32,15 @@ class TrainingStage:
     target_reward: float
     max_timesteps: int
     description: str = ""
-
 TRAINING_STAGES = [
+    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
+    # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
     TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
+    # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
+    # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
 ]
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
@@ -240,25 +246,21 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 0.5),
         grad_clip=0.5,
-        train_batch_size=8192 if not debug_mode else 128,
+        train_batch_size=4096*8 if not debug_mode else 128,
         learner_queue_size=1,
         num_sgd_iter=1,
     )
 
-    use_custom_model = True
+    use_custom_model = False
 
     custom_model_config = {
-        "custom_model": "GFootballMamba",
-        "custom_model_config": {
+    "custom_model": "GFootballTCN",
+    "custom_model_config": {
             "d_model": 128,
-            "num_layers": 3,
-            "d_state": 8,
-            "d_conv": 3,
-            "expand": 1.0,
-            "dropout": 0.03,
-            "use_amp": True,
+            "dilations": [1, 2, 4, 8],
             "gradient_checkpointing": True,
-            "layerdrop": 0.05
+            "use_amp": True,
+            "use_rolling_state": False,
         }
     }
 
@@ -455,7 +457,8 @@ def train_stage_sequential_pbt(
     best_hp = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
     best_ckpt = start_checkpoint
 
-    for gen in range(generations):
+    gen = 0
+    while True:
         candidates = [deepcopy(best_hp)] + [mutate_hparams(best_hp) for _ in range(candidates_per_gen - 1)]
 
         base_cfg_obj = create_impala_config(
@@ -539,6 +542,8 @@ def train_stage_sequential_pbt(
         else:
             print(f"⚠️ [SeqPBT] Gen {gen+1}: No valid results found. Keeping previous best ckpt: {best_ckpt}. Stopping PBT.")
             break
+
+        gen += 1
 
     print(f"\n[SeqPBT] Finished PBT for Stage '{stage.name}'.")
     print(f"   Final Best Checkpoint: {best_ckpt}")
@@ -672,7 +677,6 @@ def main():
             "gpu_per_trial": 1.0,
             "num_env_runners": 22,
             "cpus_per_runner": 1,
-            "generations": 3,
             "candidates_per_gen": 3,
             "steps_per_gen": 1_000_000,
         }
@@ -693,14 +697,14 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint = None
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer\stage_5_3v3\gen_3\run\train_impala_with_restore_1e1e8_lr=na_ent=na_vf=na_d54c\checkpoint_000002"
 
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())
 
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
-    ModelCatalog.register_custom_model("GFootballMamba", GFootballMamba)
+    ModelCatalog.register_custom_model("GFootballTCN", GFootballTCN)
 
     current_checkpoint = initial_checkpoint
     final_best_hparams = None
