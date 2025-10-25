@@ -1,3 +1,4 @@
+from logging import config
 import random
 from copy import deepcopy
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import gfootball.env as football_env
 import numpy as np
 import ray
 from gymnasium import spaces
+import torch
 from ray import train, tune
 from ray.air.config import CheckpointConfig, RunConfig
 from ray.rllib.algorithms.impala import Impala, ImpalaConfig
@@ -32,12 +34,13 @@ class TrainingStage:
     target_reward: float
     max_timesteps: int
     description: str = ""
+
 TRAINING_STAGES = [
     # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    # TrainingStage("stage_5_3v3", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000, "3 vs 3 on a full field against static opponents: focuses on offensive buildup and team coordination."),
     # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
     # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
     # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
@@ -94,10 +97,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
                  single_agent_obs_shape = _initial_obs_sample.shape
                  print(f"Assuming obs shape {single_agent_obs_shape} applies per agent.")
 
-            self.observation_space = spaces.Box(
-                low=-np.inf, high=np.inf, shape=single_agent_obs_shape, dtype=_initial_obs_sample.dtype
-            )
-
+            self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=single_agent_obs_shape, dtype=_initial_obs_sample.dtype)
             if isinstance(self.env.action_space, spaces.Tuple):
                 self.action_space = self.env.action_space.spaces[0]
             elif isinstance(self.env.action_space, spaces.Discrete):
@@ -227,6 +227,7 @@ def create_impala_config(stage: TrainingStage,
         "number_of_left_players_agent_controls": stage.left_players,
         "number_of_right_players_agent_controls": stage.right_players,
         "rewards": "scoring,checkpoints",
+        "stacked": True,
     }
     config.environment("gfootball_multi", env_config=env_config)
     config.framework("torch")
@@ -235,40 +236,50 @@ def create_impala_config(stage: TrainingStage,
         num_env_runners=0 if debug_mode else tune_config["num_env_runners"],
         num_envs_per_env_runner=1,
         num_cpus_per_env_runner=tune_config["cpus_per_runner"],
-        rollout_fragment_length=32 if not debug_mode else 8
+        rollout_fragment_length=512 if not debug_mode else 8
     )
 
     if hyperparams is None:
-        hyperparams = {"lr": 0.0001, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
+        hyperparams = {"lr": 5e-5, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
 
     config.training(
-        lr=hyperparams.get("lr", 0.0001),
+        lr=hyperparams.get("lr", 5e-5),
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 0.5),
         grad_clip=0.5,
-        train_batch_size=4096*8 if not debug_mode else 128,
-        learner_queue_size=1,
+        train_batch_size=128_280,
+        learner_queue_size=32,
         num_sgd_iter=1,
+        vtrace_clip_rho_threshold=1.0,
+        vtrace_clip_pg_rho_threshold=1.0,
     )
 
-    use_custom_model = False
+    use_custom_model =True
 
     custom_model_config = {
-    "custom_model": "GFootballTCN",
-    "custom_model_config": {
-            "d_model": 128,
-            "dilations": [1, 2, 4, 8],
-            "gradient_checkpointing": True,
-            "use_amp": True,
-            "use_rolling_state": False,
+        "custom_model": "GFootballTCN",
+        "max_seq_len": 32,
+
+        "custom_model_config": {
+            "d_model": 96,
+            "gru_hidden": 320,
+            "prev_action_emb": 16,
+            "tcn_kernel": 3,
+            "tcn_dilations": [1, 2],
+            "dropout": 0.05,
+            "gradient_checkpointing": True
         }
     }
 
     standard_model_config = {
-        "use_lstm": True,
-        "lstm_cell_size": 256,
-        "fcnet_hiddens": [256, 256],
-    }
+        "fcnet_hiddens": [256, 256, 256], 
+        "fcnet_activation": "silu", 
+        "use_lstm": True, 
+        "lstm_cell_size": 256, 
+        "lstm_use_prev_action": True, 
+        "lstm_use_prev_reward": False, 
+        "vf_share_layers": True, 
+        }
 
     if use_custom_model:
         config.model.update(custom_model_config)
@@ -276,14 +287,15 @@ def create_impala_config(stage: TrainingStage,
         config.model.update(standard_model_config)
 
     config.resources(
-        num_gpus=tune_config["gpu_per_trial"],
+        num_gpus=tune_config["gpu_per_trial"],   # = 1.0
         num_cpus_for_main_process=2
     )
     config.learners(
         num_learners=1,
-        num_gpus_per_learner=tune_config["gpu_per_trial"],
+        num_gpus_per_learner=tune_config["gpu_per_trial"],  # = 1.0
         num_cpus_per_learner=1
     )
+
 
     policies = {}
     has_left = stage.left_players > 0
@@ -320,33 +332,61 @@ def create_impala_config(stage: TrainingStage,
 
 def short_trial_name_creator(trial):
     try:
-        training_config = trial.config.get("training", {})
-        
-        lr = training_config.get("lr", "na")
-        ent = training_config.get("entropy_coeff", "na")
-        vf = training_config.get("vf_loss_coeff", "na")
+        lr = trial.config.get("lr", "na")
+        ent = trial.config.get("entropy_coeff", "na")
+        vf = trial.config.get("vf_loss_coeff", "na")
 
-
-        lr_str = f"lr={lr:.1e}" if isinstance(lr, float) else "lr=na"
-        ent_str = f"ent={ent:.3f}" if isinstance(ent, float) else "ent=na"
-        vf_str = f"vf={vf:.2f}" if isinstance(vf, float) else "vf=na"
+        if isinstance(lr, (int, float)):
+            lr_str = f"lr={lr:.1e}"
+        else:
+            lr_str = "lr=na"
+            
+        if isinstance(ent, (int, float)):
+            ent_str = f"ent={ent:.3f}"
+        else:
+            ent_str = "ent=na"
+            
+        if isinstance(vf, (int, float)):
+            vf_str = f"vf={vf:.2f}"
+        else:
+            vf_str = "vf=na"
         
         base_name = trial.trainable_name
-        trial_id = trial.trial_id[:5]
+        trial_id = trial.trial_id[:5] if len(trial.trial_id) >= 5 else trial.trial_id
         
         return f"{base_name}_{trial_id}_{lr_str}_{ent_str}_{vf_str}"
     
-    except Exception:
-        return f"{trial.trainable_name}_{trial.trial_id[:5]}_HPERROR"
+    except Exception as e:
+        try:
+            return f"{trial.trainable_name}_{trial.trial_id[:5]}_HPERROR"
+        except:
+            return "TRIAL_NAME_ERROR"
+    
 def mutate_hparams(hp: dict) -> dict:
+    import random
     def clamp(x, lo, hi): return max(lo, min(hi, x))
-    lr_range = 0.25
-    lr = clamp(hp["lr"] * (10 ** random.uniform(-lr_range, lr_range)), 1e-5, 1e-3)
-    ent_range = 0.002
-    ent = clamp(hp["entropy_coeff"] + random.uniform(-ent_range, ent_range), 0.0, 0.02)
-    vf_range = 0.2
-    vf  = clamp(hp["vf_loss_coeff"] + random.uniform(-vf_range, vf_range), 0.1, 1.2)
+    LR_MIN, LR_MAX = 5e-5, 2e-4
+    ENT_MIN, ENT_MAX = 0.003, 0.01
+    VF_MIN, VF_MAX = 0.3, 0.7
+
+    if random.random() < 0.20:
+        return dict(hp)
+
+    lr_delta = random.uniform(-0.15, 0.15)
+    lr = clamp(hp["lr"] * (10 ** lr_delta), LR_MIN, LR_MAX)
+
+    ent_step = random.uniform(-0.0015, 0.0015)
+    ent = clamp(hp["entropy_coeff"] + ent_step, ENT_MIN, ENT_MAX)
+
+    vf_step = random.uniform(-0.15, 0.15)
+    vf = clamp(hp["vf_loss_coeff"] + vf_step, VF_MIN, VF_MAX)
+
+    lr = float(f"{lr:.8f}")
+    ent = float(f"{ent:.6f}")
+    vf  = float(f"{vf:.4f}")
+
     return {"lr": lr, "entropy_coeff": ent, "vf_loss_coeff": vf}
+
 
 def train_impala_with_restore(config):
     restore_path = config.pop("_restore_from", None)
@@ -562,9 +602,9 @@ def train_single_stage(stage: TrainingStage,
     metric_path = "env_runners/episode_return_mean"
 
     hyperparams = {
-        "lr": tune.uniform(1e-5, 1e-3),
-        "entropy_coeff": tune.uniform(0.001, 0.02),
-        "vf_loss_coeff": tune.uniform(0.1, 1.0),
+        "lr": tune.loguniform(3e-5, 3e-4),
+        "entropy_coeff": tune.uniform(0.002, 0.01),
+        "vf_loss_coeff": tune.uniform(0.3, 0.7),
     }
 
     param_space = create_impala_config(
@@ -697,7 +737,7 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer\stage_5_3v3\gen_3\run\train_impala_with_restore_1e1e8_lr=na_ent=na_vf=na_d54c\checkpoint_000002"
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_day\stage_2_basic\gen_23\run\train_impala_with_restore_54ee5_lr=na_ent=na_vf=na\checkpoint_000000"
 
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
     print("Ray Cluster Resources:")

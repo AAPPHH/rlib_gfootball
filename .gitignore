@@ -3,5 +3,6 @@
 /football-venv/
 
 /training_results_transfer/
+/training_results_transfer_day/
 /training_results_transfer_pbt_2/
-/training_results_transfer_pbt_mamba/
+/training_results_transfer_gold/
