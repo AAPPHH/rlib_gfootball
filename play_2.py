@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 
 try:
-    from model import GFootballMambaHybrid2025, GFootballMambaLite2025
+    from model import GFootballTCN
 except ImportError as e:
     print(f"❌ model.py nicht gefunden: {e}")
 
@@ -222,8 +222,7 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
     ray.init(ignore_reinit_error=True, local_mode=True, log_to_driver=False)
     
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
-    ModelCatalog.register_custom_model("mamba_hybrid_2025", GFootballMambaHybrid2025)
-    ModelCatalog.register_custom_model("mamba_lite_2025", GFootballMambaLite2025)
+    ModelCatalog.register_custom_model("GFootballTCN", GFootballTCN)
     
     config = (
         ImpalaConfig()
@@ -235,12 +234,20 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
         .framework("torch")
         .env_runners(num_env_runners=0)
         .training(
-            model={
-                "custom_model": "mamba_hybrid_2025", 
+            model = {
+                "custom_model": "GFootballTCN",
+                "max_seq_len": 32,
+                "lstm_use_prev_action": True, 
+                "lstm_use_prev_reward": False,
+
                 "custom_model_config": {
-                    "d_model": 256, "num_layers": 4, "d_state": 16,
-                    "num_heads": 4, "use_attention": True, "dropout": 0.1,
-                    "use_amp": True,
+                    "d_model": 96,
+                    "gru_hidden": 320,
+                    "prev_action_emb": 16,
+                    "tcn_kernel": 3,
+                    "tcn_dilations": [1, 2],
+                    "dropout": 0.05,
+                    "gradient_checkpointing": True
                 }
             }
         )
@@ -261,7 +268,7 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
         if checkpoint_path:
             algo = config.build() 
             algo.restore(checkpoint_path)
-            
+        
     except Exception as e:
         print(f"❌ Fehler beim Bauen/Laden des Agenten: {e}")
         if algo: algo.stop()
@@ -284,61 +291,93 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
                 if algo: algo.stop() 
                 algo = config.build() 
             
+            policy_left = algo.get_policy("policy_left") if stage["left"] > 0 else None
+            policy_right = algo.get_policy("policy_right") if stage["right"] > 0 else None
+
+            states_left = {}
+            prev_actions_left = {}
+            if policy_left:
+                for i in range(stage["left"]):
+                    agent_id = f"left_{i}"
+                    states_left[agent_id] = policy_left.get_initial_state()
+                    prev_actions_left[agent_id] = 0
+
+            states_right = {}
+            prev_actions_right = {}
+            if policy_right:
+                 for i in range(stage["right"]):
+                    agent_id = f"right_{i}"
+                    states_right[agent_id] = policy_right.get_initial_state()
+                    prev_actions_right[agent_id] = 0
+
             obs_train, obs_video = dual_env.reset()
             
             obs_dict = {}
             num_expected_obs = stage["left"] + stage["right"]
             if num_expected_obs == 0:
-                 obs_dict = {} 
+                obs_dict = {} 
             elif num_expected_obs == 1 and stage["left"] == 1:
                 obs_dict = {"left_0": obs_train[0] if isinstance(obs_train, list) and len(obs_train) > 0 and isinstance(obs_train[0], np.ndarray) and len(obs_train[0].shape) > 1 else obs_train}
             elif isinstance(obs_train, (list, np.ndarray)) and len(obs_train) >= num_expected_obs:
-                 obs_dict = {f"left_{i}": obs_train[i] for i in range(stage["left"])}
-                 if stage["right"] > 0:
-                     obs_dict.update({f"right_{i}": obs_train[stage["left"] + i] for i in range(stage["right"])})
+                obs_dict = {f"left_{i}": obs_train[i] for i in range(stage["left"])}
+                if stage["right"] > 0:
+                    obs_dict.update({f"right_{i}": obs_train[stage["left"] + i] for i in range(stage["right"])})
             elif isinstance(obs_train, np.ndarray) and len(obs_train.shape) > 0 and obs_train.shape[0] >= num_expected_obs:
-                 obs_reshaped = obs_train.reshape(num_expected_obs, -1)
-                 obs_dict = {f"left_{i}": obs_reshaped[i] for i in range(stage["left"])}
-                 if stage["right"] > 0:
-                     obs_dict.update({f"right_{i}": obs_reshaped[stage["left"] + i] for i in range(stage["right"])})
+                obs_reshaped = obs_train.reshape(num_expected_obs, -1)
+                obs_dict = {f"left_{i}": obs_reshaped[i] for i in range(stage["left"])}
+                if stage["right"] > 0:
+                    obs_dict.update({f"right_{i}": obs_reshaped[stage["left"] + i] for i in range(stage["right"])})
             else:
-                 print(f"Warnung: Unerwartetes Observationsformat oder Länge. Überspringe Episode {ep + 1}.")
-                 continue 
+                print(f"Warnung: Unerwartetes Observationsformat oder Länge. Überspringe Episode {ep + 1}.")
+                continue 
 
             done = False
             step_count = 0
             
             while not done:
                 actions = []
+                
                 for i in range(stage["left"]):
                     agent_id = f"left_{i}"
                     if agent_id in obs_dict:
-                        action = algo.compute_single_action(
-                            observation=obs_dict[agent_id], policy_id="policy_left", explore=False
+                        action, new_state, _ = algo.compute_single_action(
+                            observation=obs_dict[agent_id],
+                            state=states_left[agent_id],
+                            prev_action=prev_actions_left[agent_id],
+                            policy_id="policy_left",
+                            explore=False
                         )
                         actions.append(action)
+                        states_left[agent_id] = new_state
+                        prev_actions_left[agent_id] = action
                     elif stage["left"] > 0: actions.append(0) 
 
                 for i in range(stage["right"]):
                     agent_id = f"right_{i}"
                     if agent_id in obs_dict:
-                        action = algo.compute_single_action(
-                            observation=obs_dict[agent_id], policy_id="policy_right", explore=False
+                        action, new_state, _ = algo.compute_single_action(
+                            observation=obs_dict[agent_id],
+                            state=states_right[agent_id],
+                            prev_action=prev_actions_right[agent_id],
+                            policy_id="policy_right",
+                            explore=False
                         )
                         actions.append(action)
-                    elif stage["right"] > 0: actions.append(0) 
+                        states_right[agent_id] = new_state
+                        prev_actions_right[agent_id] = action
+                    elif stage["right"] > 0: actions.append(0)
 
                 if num_expected_obs == 0:
-                     num_players_total = 1 # Fallback if action space unknown
-                     if hasattr(dual_env.train_env, 'action_space') and hasattr(dual_env.train_env.action_space, 'n'):
-                         num_players_total = dual_env.train_env.action_space.n 
-                     actions = [0] * num_players_total 
+                    num_players_total = 1 
+                    if hasattr(dual_env.train_env, 'action_space') and hasattr(dual_env.train_env.action_space, 'n'):
+                        num_players_total = dual_env.train_env.action_space.n 
+                    actions = [0] * num_players_total 
                 
                 obs_train, reward, done, info = dual_env.step(actions)
-                
+
                 obs_dict = {}
                 if num_expected_obs == 0:
-                     obs_dict = {}
+                    obs_dict = {}
                 elif num_expected_obs == 1 and stage["left"] == 1:
                     obs_dict = {"left_0": obs_train[0] if isinstance(obs_train, list) and len(obs_train) > 0 and isinstance(obs_train[0], np.ndarray) and len(obs_train[0].shape) > 1 else obs_train}
                 elif isinstance(obs_train, (list, np.ndarray)) and len(obs_train) >= num_expected_obs:
@@ -346,12 +385,12 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
                     if stage["right"] > 0:
                         obs_dict.update({f"right_{i}": obs_train[stage["left"] + i] for i in range(stage["right"])})
                 elif isinstance(obs_train, np.ndarray) and len(obs_train.shape) > 0 and obs_train.shape[0] >= num_expected_obs:
-                     obs_reshaped = obs_train.reshape(num_expected_obs, -1)
-                     obs_dict = {f"left_{i}": obs_reshaped[i] for i in range(stage["left"])}
-                     if stage["right"] > 0:
-                         obs_dict.update({f"right_{i}": obs_reshaped[stage["left"] + i] for i in range(stage["right"])})
+                        obs_reshaped = obs_train.reshape(num_expected_obs, -1)
+                        obs_dict = {f"left_{i}": obs_reshaped[i] for i in range(stage["left"])}
+                        if stage["right"] > 0:
+                            obs_dict.update({f"right_{i}": obs_reshaped[stage["left"] + i] for i in range(stage["right"])})
                 else:
-                     done = True 
+                    done = True 
 
                 step_count += 1
             
@@ -368,8 +407,8 @@ def create_video_demo(checkpoint_path: str, stage_key: str = "1v0", num_episodes
 
 if __name__ == "__main__":
     
-    USE_RANDOM_WEIGHTS = True 
-    CHECKPOINT_PFAD = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_1_20251019_191114\9e3b0_00001\checkpoint_000086"
+    USE_RANDOM_WEIGHTS = False
+    CHECKPOINT_PFAD = r"C:\clones\rlib_gfootball\training_results_transfer_night_2\stage_2_basic\gen_52\run\train_impala_with_restore_20f03_lr=na_ent=na_vf=na\checkpoint_000000"
     STAGE_KEY = "s2_run_to_score"
     NUM_EPISODEN = 5
 

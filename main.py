@@ -287,12 +287,12 @@ def create_impala_config(stage: TrainingStage,
         config.model.update(standard_model_config)
 
     config.resources(
-        num_gpus=tune_config["gpu_per_trial"],   # = 1.0
+        num_gpus=tune_config["gpu_per_trial"],
         num_cpus_for_main_process=2
     )
     config.learners(
         num_learners=1,
-        num_gpus_per_learner=tune_config["gpu_per_trial"],  # = 1.0
+        num_gpus_per_learner=tune_config["gpu_per_trial"],
         num_cpus_per_learner=1
     )
 

@@ -171,7 +171,11 @@ class GFootballTCN(TorchRNN, nn.Module):
         BT, obs_dim = obs_flat.shape
         device = obs_flat.device
         
-        T_max = int(seq_lens.max().item())
+        if seq_lens is None:
+            T_max = 1
+        else:
+            T_max = int(seq_lens.max().item())
+
         B = int(BT // T_max)
         
         if B * T_max != BT:
