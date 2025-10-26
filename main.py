@@ -22,6 +22,7 @@ from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
 
 from model import GFootballTCN
+from model_2 import GFootballGNN
 from policy_pool import EnhancedSelfPlayCallback
 
 @dataclass
@@ -236,8 +237,9 @@ def create_impala_config(stage: TrainingStage,
         num_env_runners=0 if debug_mode else tune_config["num_env_runners"],
         num_envs_per_env_runner=1,
         num_cpus_per_env_runner=tune_config["cpus_per_runner"],
-        rollout_fragment_length=512 if not debug_mode else 8
+        rollout_fragment_length=128 if not debug_mode else 8
     )
+    config.rollouts(batch_mode="truncate_episodes")
 
     if hyperparams is None:
         hyperparams = {"lr": 5e-5, "entropy_coeff": 0.008, "vf_loss_coeff": 0.5}
@@ -247,29 +249,46 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 0.5),
         grad_clip=0.5,
-        train_batch_size=128_280,
-        learner_queue_size=32,
+        train_batch_size=64_000,
+        learner_queue_size=8,
         num_sgd_iter=1,
         vtrace_clip_rho_threshold=1.0,
         vtrace_clip_pg_rho_threshold=1.0,
     )
 
     use_custom_model =True
+    
 
     custom_model_config = {
-        "custom_model": "GFootballTCN",
-        "max_seq_len": 32,
-
-        "custom_model_config": {
-            "d_model": 96,
-            "gru_hidden": 320,
-            "prev_action_emb": 16,
-            "tcn_kernel": 3,
-            "tcn_dilations": [1, 2],
-            "dropout": 0.05,
-            "gradient_checkpointing": True
-        }
+    "custom_model": "GFootballGNN",
+    "max_seq_len": 32,
+    "custom_model_config": {
+        "d_model": 48,
+        "gnn_hidden": 24,
+        "gnn_k": 4,
+        "prev_action_emb": 8, 
+        "gradient_checkpointing": True,
+        "dropout": 0.05,
+        "tcn_kernel": 3,
+        "gru_hidden": 192,
+        "tcn_dilations": [1, 2],
+        "gnn_last_only": True,
     }
+}
+    # custom_model_config = {
+    #     "custom_model": "GFootballTCN",
+    #     "max_seq_len": 32,
+
+    #     "custom_model_config": {
+    #         "d_model": 96,
+    #         "gru_hidden": 320,
+    #         "prev_action_emb": 16,
+    #         "tcn_kernel": 3,
+    #         "tcn_dilations": [1, 2],
+    #         "dropout": 0.05,
+    #         "gradient_checkpointing": True
+    #     }
+    # }
 
     standard_model_config = {
         "fcnet_hiddens": [256, 256, 256], 
@@ -745,6 +764,7 @@ def main():
 
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
     ModelCatalog.register_custom_model("GFootballTCN", GFootballTCN)
+    ModelCatalog.register_custom_model("GFootballGNN", GFootballGNN)
 
     current_checkpoint = initial_checkpoint
     final_best_hparams = None
