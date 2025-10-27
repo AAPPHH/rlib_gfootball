@@ -14,6 +14,43 @@ from ray.rllib.utils.annotations import override
 from ray.rllib.utils.typing import ModelConfigDict, TensorType
 from ray.rllib.policy.view_requirement import ViewRequirement
 
+class KANLayer(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, grid_size: int = 5):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.grid_size = grid_size
+        
+        self.in_norm = nn.LayerNorm(in_dim)
+        
+        self.spline_weight = nn.Parameter(torch.randn(out_dim, in_dim, grid_size) * 0.1)
+        self.scale_base = nn.Parameter(torch.ones(out_dim, in_dim))
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+        
+        self.rbf_beta = nn.Parameter(torch.ones(1) * 2.0)
+        
+        self.register_buffer('grid', torch.linspace(-1, 1, grid_size))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.in_norm(x)
+        
+        B = x.shape[0]
+        x_expanded = x.unsqueeze(1)
+        
+        grid = self.grid.to(x.dtype).to(x.device)
+        grid_expanded = grid.view(1, 1, 1, -1)
+        x_grid = x_expanded.unsqueeze(-1)
+        
+        beta = self.rbf_beta.clamp(0.5, 6.0)
+        basis = torch.exp(-((x_grid - grid_expanded) ** 2) * beta)
+        
+        spline_out = torch.einsum('bdig,oid->bod', basis, self.spline_weight)
+        
+        base_out = torch.einsum('bi,oi->bo', x, self.scale_base)
+        spline_sum = spline_out.sum(dim=-1)
+        
+        return base_out + spline_sum + self.bias
+
 class GNNEncoder(nn.Module):
     
     def __init__(self, node_dim: int, hidden_dim: int):
@@ -39,13 +76,12 @@ class FiLMLayer(nn.Module):
         self.gamma = nn.Linear(cond_dim, base_dim, bias=False)
         self.beta = nn.Linear(cond_dim, base_dim, bias=False)
         
-        # Init: gamma ≈ 1, beta ≈ 0 (neutraler Start)
         nn.init.constant_(self.gamma.weight, 0.0)
         nn.init.constant_(self.beta.weight, 0.0)
     
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        gamma = 1.0 + self.gamma(cond)  # [B, base_dim]
-        beta = self.beta(cond)           # [B, base_dim]
+        gamma = 1.0 + self.gamma(cond)
+        beta = self.beta(cond)
         return gamma * x + beta
 
 
@@ -127,6 +163,9 @@ class GFootballGNN(TorchRNN, nn.Module):
         self.use_checkpoint = cfg.get("gradient_checkpointing", True)
         self.dropout = cfg.get("dropout", 0.05)
         
+        self.use_kan = cfg.get("use_kan", True)
+        self.kan_grid = cfg.get("kan_grid", 5)
+        
         self.use_gnn = cfg.get("use_gnn", True)
         self.gnn_hidden = cfg.get("gnn_hidden", 32) 
         self.gnn_last_only = cfg.get("gnn_last_only", False)
@@ -147,18 +186,23 @@ class GFootballGNN(TorchRNN, nn.Module):
         self.register_buffer("adj_eye", torch.eye(self.num_players, dtype=torch.float32))
             
         if self.use_gnn:
-            # Node-Features: [x, y, vx, vy, team_id, ball_prox, Δx_team, Δy_team] = 8 Dimensionen
             self.node_feature_dim = 8
             self.gnn_encoder = GNNEncoder(self.node_feature_dim, self.gnn_hidden)
             
-            # FiLM statt Concat: Base-Encoder bleibt klein
-            self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
+            if self.use_kan:
+                self.frame_encoder = KANLayer(self.frame_dim, self.d_model, grid_size=self.kan_grid)
+            else:
+                self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
+            
             self.film_layer = FiLMLayer(self.d_model, self.gnn_hidden)
             
             if self.gnn_last_only:
                 self.null_gnn = nn.Parameter(torch.zeros(1, self.gnn_hidden))
         else:
-            self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
+            if self.use_kan:
+                self.frame_encoder = KANLayer(self.frame_dim, self.d_model, grid_size=self.kan_grid)
+            else:
+                self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
         
         self.frame_norm = nn.LayerNorm(self.d_model)
         
@@ -190,49 +234,49 @@ class GFootballGNN(TorchRNN, nn.Module):
                     nn.init.constant_(param, 0.0)
         
         self.fuse_dim = self.gru_hidden
+        
         self.adapt_gnn = nn.Linear(self.d_model, self.fuse_dim, bias=False)
         self.adapt_tcn = nn.Linear(self.d_model, self.fuse_dim, bias=False)
-        self.adapt_gru = nn.Identity()
-        self.fuse_logits = nn.Parameter(torch.tensor([0.15, 0.35, 0.50]))
+        self.adapt_gru = nn.Linear(self.gru_hidden, self.fuse_dim, bias=False)
+        
+        self.fuse_logits = nn.Parameter(torch.tensor([-0.7, -0.3, 0.0]))
+        self.fuse_temp = nn.Parameter(torch.ones(1))
         self.fuse_ln = nn.LayerNorm(self.fuse_dim)
         
-        self.fuse_temp = nn.Parameter(torch.tensor(1.0))
-        self.head_gate = nn.Sequential(nn.Linear(self.fuse_dim, self.fuse_dim), 
-                                       nn.SiLU())
+        self.head_gate = nn.Sequential(
+            nn.Linear(self.fuse_dim, self.fuse_dim),
+            nn.Sigmoid()
+        )
+        
         self.pi_ln = nn.LayerNorm(self.fuse_dim)
-        self.v_ln  = nn.LayerNorm(self.fuse_dim)
-
+        self.v_ln = nn.LayerNorm(self.fuse_dim)
+        
         self._value_out = None
-    
+
     @override(TorchRNN)
-    def get_initial_state(self) -> List[torch.Tensor]:
-        return [torch.zeros(self.gru_hidden, dtype=torch.float32)]
+    def get_initial_state(self) -> List[TensorType]:
+        return [torch.zeros(self.gru_hidden)]
     
     @staticmethod
     @jit.script
-    def _parse_frame_to_graph_impl(
-        frame_curr: torch.Tensor,
-        frame_prev: torch.Tensor,
-        adj_eye: torch.Tensor, 
-        gnn_k: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _parse_frame_to_graph_impl(frame_curr: torch.Tensor, frame_prev: torch.Tensor,
+                                       adj_eye: torch.Tensor, gnn_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
         
         B = frame_curr.size(0)
         device = frame_curr.device
         
-        ball_pos = frame_curr[:, 0:2] 
+        ball_pos = frame_curr[:, :2]
+        left_pos = frame_curr[:, 3:25].view(B, 11, 2)
+        right_pos = frame_curr[:, 25:47].view(B, 11, 2)
         
-        # Aktuelle Positionen
-        left_pos = frame_curr[:, 3:25].reshape(B, 11, 2)
-        right_pos = frame_curr[:, 25:47].reshape(B, 11, 2)
-        all_pos = torch.cat([left_pos, right_pos], dim=1)  # [B, 22, 2]
+        ball_pos_prev = frame_prev[:, :2]
+        left_pos_prev = frame_prev[:, 3:25].view(B, 11, 2)
+        right_pos_prev = frame_prev[:, 25:47].view(B, 11, 2)
         
-        # Vorherige Positionen (für Geschwindigkeit)
-        left_pos_prev = frame_prev[:, 3:25].reshape(B, 11, 2)
-        right_pos_prev = frame_prev[:, 25:47].reshape(B, 11, 2)
-        all_pos_prev = torch.cat([left_pos_prev, right_pos_prev], dim=1)  # [B, 22, 2]
+        all_pos = torch.cat([left_pos, right_pos], dim=1)
+        all_pos_prev = torch.cat([left_pos_prev, right_pos_prev], dim=1)
         
-        all_vel = all_pos - all_pos_prev  # [B, 22, 2]
+        all_vel = all_pos - all_pos_prev
 
         team_id = torch.cat([
             torch.zeros(B, 11, 1, device=device),
@@ -243,7 +287,7 @@ class GFootballGNN(TorchRNN, nn.Module):
         ball_dist = torch.norm(all_pos - ball_pos_exp, dim=-1, keepdim=True) 
         ball_prox = torch.exp(-ball_dist * 2)
         
-        left_center = left_pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        left_center = left_pos.mean(dim=1, keepdim=True)
         right_center = right_pos.mean(dim=1, keepdim=True)
         team_center = torch.cat([
             left_center.expand(-1, 11, -1), 
@@ -280,16 +324,14 @@ class GFootballGNN(TorchRNN, nn.Module):
         with autocast(device_type=device.type, dtype=torch.bfloat16):
             if self.use_gnn:
                 if self.gnn_last_only:
-                    # Preallocate - spart temporäre List-Allokationen
                     gnn_stacked = torch.empty(B, self.num_frames, self.gnn_hidden, 
-                                              device=device, dtype=torch.bfloat16)
+                                                device=device, dtype=torch.bfloat16)
                     
                     frame_curr = obs_frames[:, -1, :]
                     frame_prev = obs_frames[:, -2, :] if self.num_frames > 1 else frame_curr
                     nodes, adj = self._parse_frame_to_graph(frame_curr, frame_prev)
                     gnn_emb_last = self.gnn_encoder(nodes, adj)
                     
-                    # In-place assignment statt List+Stack
                     null_emb = self.null_gnn.expand(B, -1).to(torch.bfloat16)
                     for t in range(self.num_frames - 1):
                         gnn_stacked[:, t] = null_emb
@@ -306,18 +348,23 @@ class GFootballGNN(TorchRNN, nn.Module):
                     
                     gnn_stacked = torch.stack(gnn_embs, dim=1)
                 
-                x = self.frame_encoder(obs_frames)  # [B, T, d_model]
-                
-                x_modulated = []
-                for t in range(self.num_frames):
-                    x_t = x[:, t, :]                # [B, d_model]
-                    gnn_t = gnn_stacked[:, t, :]    # [B, gnn_hidden]
-                    x_t_mod = self.film_layer(x_t, gnn_t)
-                    x_modulated.append(x_t_mod)
-                
-                x = torch.stack(x_modulated, dim=1)  # [B, T, d_model]
+                obs_flat = obs_frames.reshape(B * self.num_frames, self.frame_dim)
+                x = self.frame_encoder(obs_flat)
+                x = x.reshape(B, self.num_frames, self.d_model)
+
+                B_orig, T_frames, D_model = x.shape
+                gnn_D_hidden = gnn_stacked.shape[-1]
+
+                x_flat = x.reshape(B_orig * T_frames, D_model)
+                gnn_flat = gnn_stacked.reshape(B_orig * T_frames, gnn_D_hidden)
+
+                x_mod_flat = self.film_layer(x_flat, gnn_flat)
+
+                x = x_mod_flat.view(B_orig, T_frames, D_model)
             else:
-                x = self.frame_encoder(obs_frames) 
+                obs_flat = obs_frames.reshape(B * self.num_frames, self.frame_dim)
+                x = self.frame_encoder(obs_flat)
+                x = x.reshape(B, self.num_frames, self.d_model)
             
             x = F.relu(self.frame_norm(x))
             
@@ -329,7 +376,7 @@ class GFootballGNN(TorchRNN, nn.Module):
             z_t = 0.6 * x.mean(dim=1) + 0.4 * x.max(dim=1)[0]
             
             if self.use_gnn:
-                x_last = self.frame_encoder(obs_frames[:, -1, :])
+                x_last = x[:, -1, :]
                 z_gnn_last = self.film_layer(x_last, gnn_stacked[:, -1, :])
             else:
                 z_gnn_last = z_tcn_last
@@ -409,7 +456,7 @@ class GFootballGNN(TorchRNN, nn.Module):
             h_fused = self.head_gate(h_fused)
             
             logits_bf16 = self.policy_head(self.pi_ln(h_fused))
-            value_bf16 = self.value_head(self.v_ln(h_fused.detach())).squeeze(-1)
+            value_bf16 = self.value_head(self.v_ln(h_fused)).squeeze(-1)
         
         logits = logits_bf16.float()
         self._value_out = value_bf16.float()

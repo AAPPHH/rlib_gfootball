@@ -258,7 +258,6 @@ def create_impala_config(stage: TrainingStage,
 
     use_custom_model =True
     
-
     custom_model_config = {
     "custom_model": "GFootballGNN",
     "max_seq_len": 32,
@@ -272,7 +271,10 @@ def create_impala_config(stage: TrainingStage,
         "tcn_kernel": 3,
         "gru_hidden": 192,
         "tcn_dilations": [1, 2],
+        "use_gnn": True,
         "gnn_last_only": True,
+        "use_kan": True
+
     }
 }
     # custom_model_config = {
