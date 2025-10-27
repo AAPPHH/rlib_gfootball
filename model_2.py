@@ -232,33 +232,27 @@ class GFootballGNN(TorchRNN, nn.Module):
         right_pos_prev = frame_prev[:, 25:47].reshape(B, 11, 2)
         all_pos_prev = torch.cat([left_pos_prev, right_pos_prev], dim=1)  # [B, 22, 2]
         
-        # Geschwindigkeit: v = pos_t - pos_t-1
         all_vel = all_pos - all_pos_prev  # [B, 22, 2]
-        
-        # Team-ID (0 = links, 1 = rechts)
+
         team_id = torch.cat([
             torch.zeros(B, 11, 1, device=device),
             torch.ones(B, 11, 1, device=device)
         ], dim=1) 
         
-        # Distanz zum Ball
         ball_pos_exp = ball_pos.unsqueeze(1) 
         ball_dist = torch.norm(all_pos - ball_pos_exp, dim=-1, keepdim=True) 
         ball_prox = torch.exp(-ball_dist * 2)
         
-        # Team-Struktur: Δp_team = pi - mean(p_team)
         left_center = left_pos.mean(dim=1, keepdim=True)  # [B, 1, 2]
         right_center = right_pos.mean(dim=1, keepdim=True)
         team_center = torch.cat([
             left_center.expand(-1, 11, -1), 
             right_center.expand(-1, 11, -1)
-        ], dim=1)  # [B, 22, 2]
-        delta_team = all_pos - team_center  # [B, 22, 2]
+        ], dim=1)
+        delta_team = all_pos - team_center
         
-        # Node-Features: [x, y, vx, vy, team_id, ball_prox, Δx_team, Δy_team] = 8 Features
         node_features = torch.cat([all_pos, all_vel, team_id, ball_prox, delta_team], dim=-1)
         
-        # Optimierte K-NN Adjacency (binär, no_grad für Distanzen)
         pos_i = all_pos.unsqueeze(2) 
         pos_j = all_pos.unsqueeze(1) 
         
@@ -302,7 +296,6 @@ class GFootballGNN(TorchRNN, nn.Module):
                     gnn_stacked[:, -1] = gnn_emb_last
                 
                 else:
-                    # Alle Frames: List+Stack OK bei nur 4 Frames
                     gnn_embs = []
                     for f in range(self.num_frames):
                         frame_curr = obs_frames[:, f, :]
@@ -313,10 +306,8 @@ class GFootballGNN(TorchRNN, nn.Module):
                     
                     gnn_stacked = torch.stack(gnn_embs, dim=1)
                 
-                # FiLM-Conditioning statt Concat
                 x = self.frame_encoder(obs_frames)  # [B, T, d_model]
                 
-                # Pro Frame: FiLM-Modulation
                 x_modulated = []
                 for t in range(self.num_frames):
                     x_t = x[:, t, :]                # [B, d_model]
@@ -338,7 +329,6 @@ class GFootballGNN(TorchRNN, nn.Module):
             z_t = 0.6 * x.mean(dim=1) + 0.4 * x.max(dim=1)[0]
             
             if self.use_gnn:
-                # Für z_gnn_last: letzten Frame mit GNN nochmal encodieren
                 x_last = self.frame_encoder(obs_frames[:, -1, :])
                 z_gnn_last = self.film_layer(x_last, gnn_stacked[:, -1, :])
             else:
