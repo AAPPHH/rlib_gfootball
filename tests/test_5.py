@@ -1,9 +1,9 @@
 import numpy as np
 import gfootball.env as football_env
 
-def test_rewards_mode(rewards_mode="scoring", episodes=10, end_on_score=True):
+def test_rewards_mode(rewards_mode="scoring,checkpoints", episodes=10, end_on_score=True):
     env = football_env.create_environment(
-        env_name="academy_empty_goal_close",
+        env_name="academy_single_goal_versus_lazy",
         representation="simple115v2",
         number_of_left_players_agent_controls=1,
         number_of_right_players_agent_controls=0,
@@ -30,8 +30,8 @@ def test_rewards_mode(rewards_mode="scoring", episodes=10, end_on_score=True):
     print(f"[{rewards_mode}] mean={np.mean(totals):.3f}, max={np.max(totals):.3f}")
     env.close()
 
-# Erwartung:
-test_rewards_mode("scoring", episodes=20, end_on_score=True)               # <= 1.0
-test_rewards_mode("checkpoints", episodes=20, end_on_score=True)           # meist < 1.0, kann variieren
-test_rewards_mode("scoring,checkpoints", episodes=20, end_on_score=True)   # oft > 1.0
+# # Erwartung:
+# test_rewards_mode("scoring", episodes=20, end_on_score=True)               # <= 1.0
+# test_rewards_mode("checkpoints", episodes=20, end_on_score=True)           # meist < 1.0, kann variieren
+test_rewards_mode("scoring,checkpoints", episodes=100, end_on_score=True)   # oft > 1.0 
 

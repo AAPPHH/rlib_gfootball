@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from torch.amp import autocast 
 import torch.jit as jit
 from gymnasium.spaces import Space
 from typing import Tuple, Optional, List, Dict
@@ -59,30 +58,11 @@ class GNNEncoder(nn.Module):
         self.edge_weight = nn.Parameter(torch.ones(1) * 0.5)
     
     def forward(self, node_features: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:
-        
         x = self.node_proj(node_features) 
-        
         x_agg = torch.bmm(adj_matrix, x) 
-        
         x = x * (1 - self.edge_weight) + x_agg * self.edge_weight
-        
         graph_emb = x.mean(dim=1) 
-        
         return graph_emb
-
-class FiLMLayer(nn.Module):
-    def __init__(self, base_dim: int, cond_dim: int):
-        super().__init__()
-        self.gamma = nn.Linear(cond_dim, base_dim, bias=False)
-        self.beta = nn.Linear(cond_dim, base_dim, bias=False)
-        
-        nn.init.constant_(self.gamma.weight, 0.0)
-        nn.init.constant_(self.beta.weight, 0.0)
-    
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        gamma = 1.0 + self.gamma(cond)
-        beta = self.beta(cond)
-        return gamma * x + beta
 
 
 class DepthwiseSeparableConv1d(nn.Module):
@@ -167,8 +147,7 @@ class GFootballGNN(TorchRNN, nn.Module):
         self.kan_grid = cfg.get("kan_grid", 5)
         
         self.use_gnn = cfg.get("use_gnn", True)
-        self.gnn_hidden = cfg.get("gnn_hidden", 32) 
-        self.gnn_last_only = cfg.get("gnn_last_only", False)
+        self.gnn_hidden = cfg.get("gnn_hidden", 32)
         self.gnn_k = cfg.get("gnn_k", 6)
         
         self.num_frames = 4
@@ -184,38 +163,34 @@ class GFootballGNN(TorchRNN, nn.Module):
         
         self.num_players = 22
         self.register_buffer("adj_eye", torch.eye(self.num_players, dtype=torch.float32))
-            
-        if self.use_gnn:
-            self.node_feature_dim = 8
-            self.gnn_encoder = GNNEncoder(self.node_feature_dim, self.gnn_hidden)
-            
-            if self.use_kan:
-                self.frame_encoder = KANLayer(self.frame_dim, self.d_model, grid_size=self.kan_grid)
-            else:
-                self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
-            
-            self.film_layer = FiLMLayer(self.d_model, self.gnn_hidden)
-            
-            if self.gnn_last_only:
-                self.null_gnn = nn.Parameter(torch.zeros(1, self.gnn_hidden))
+        
+        # Frame Encoder
+        if self.use_kan:
+            self.frame_encoder = KANLayer(self.frame_dim, self.d_model, grid_size=self.kan_grid)
         else:
-            if self.use_kan:
-                self.frame_encoder = KANLayer(self.frame_dim, self.d_model, grid_size=self.kan_grid)
-            else:
-                self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
+            self.frame_encoder = nn.Linear(self.frame_dim, self.d_model)
         
         self.frame_norm = nn.LayerNorm(self.d_model)
         
+        # TCN Blocks
         self.tcn_blocks = nn.ModuleList([
             EfficientTCNBlock(self.d_model, self.tcn_kernel, dil, self.dropout, self.use_checkpoint)
             for dil in self.tcn_dilations
         ])
+        
+        # GNN Encoder
+        if self.use_gnn:
+            self.node_feature_dim = 8
+            self.gnn_encoder = GNNEncoder(self.node_feature_dim, self.gnn_hidden)
 
+        # Previous Action Embedding
         self.prev_action_embed = nn.Embedding(action_space.n, self.prev_action_emb_dim)
         
-        self.gru_input_size = self.d_model + self.prev_action_emb_dim
+        # *** ARCHITEKTUR-OPTIMIERUNG: Direktes Concat ohne Bottlenecks ***
+        self.gru_input_size = self.d_model + self.gnn_hidden + self.prev_action_emb_dim
         self.gru = nn.GRU(self.gru_input_size, self.gru_hidden, batch_first=True)
 
+        # *** ARCHITEKTUR-OPTIMIERUNG: Einfache Heads ***
         self.policy_head = nn.Sequential(
             nn.Linear(self.gru_hidden, max(64, self.gru_hidden // 2)),
             nn.ReLU(),
@@ -228,30 +203,19 @@ class GFootballGNN(TorchRNN, nn.Module):
             nn.Linear(max(32, self.gru_hidden // 4), 1)
         )
         
+        # GRU Bias Initialization
         with torch.no_grad():
             for name, param in self.gru.named_parameters():
                 if "bias_ih" in name or "bias_hh" in name:
                     nn.init.constant_(param, 0.0)
         
-        self.fuse_dim = self.gru_hidden
-        
-        self.adapt_gnn = nn.Linear(self.d_model, self.fuse_dim, bias=False)
-        self.adapt_tcn = nn.Linear(self.d_model, self.fuse_dim, bias=False)
-        self.adapt_gru = nn.Linear(self.gru_hidden, self.fuse_dim, bias=False)
-        
-        self.fuse_logits = nn.Parameter(torch.tensor([-0.7, -0.3, 0.0]))
-        self.fuse_temp = nn.Parameter(torch.ones(1))
-        self.fuse_ln = nn.LayerNorm(self.fuse_dim)
-        
-        self.head_gate = nn.Sequential(
-            nn.Linear(self.fuse_dim, self.fuse_dim),
-            nn.Sigmoid()
-        )
-        
-        self.pi_ln = nn.LayerNorm(self.fuse_dim)
-        self.v_ln = nn.LayerNorm(self.fuse_dim)
-        
         self._value_out = None
+        
+        print(f"[GFootballGNN] Memory-optimized architecture:")
+        print(f"  - GRU input: {self.gru_input_size} (direct concat, no bottlenecks)")
+        print(f"  - No post-GRU fusion")
+        print(f"  - No FiLM")
+        print(f"  - No autocast")
 
     @override(TorchRNN)
     def get_initial_state(self) -> List[TensorType]:
@@ -260,7 +224,7 @@ class GFootballGNN(TorchRNN, nn.Module):
     @staticmethod
     @jit.script
     def _parse_frame_to_graph_impl(frame_curr: torch.Tensor, frame_prev: torch.Tensor,
-                                       adj_eye: torch.Tensor, gnn_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                                     adj_eye: torch.Tensor, gnn_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
         
         B = frame_curr.size(0)
         device = frame_curr.device
@@ -316,76 +280,54 @@ class GFootballGNN(TorchRNN, nn.Module):
     def _parse_frame_to_graph(self, frame_curr: torch.Tensor, frame_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._parse_frame_to_graph_impl(frame_curr, frame_prev, self.adj_eye, self.gnn_k)
     
-    def _encode_frames(self, obs_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        
+    def _encode_frames(self, obs_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        *** MEMORY-OPTIMIERT ***
+        - Kein autocast (keine dtype Konversionen)
+        - Keine intermediate Tensoren
+        - Direktes pooling
+        """
         B = obs_frames.size(0)
         device = obs_frames.device
         
-        with autocast(device_type=device.type, dtype=torch.bfloat16):
-            if self.use_gnn:
-                if self.gnn_last_only:
-                    gnn_stacked = torch.empty(B, self.num_frames, self.gnn_hidden, 
-                                                device=device, dtype=torch.bfloat16)
-                    
-                    frame_curr = obs_frames[:, -1, :]
-                    frame_prev = obs_frames[:, -2, :] if self.num_frames > 1 else frame_curr
-                    nodes, adj = self._parse_frame_to_graph(frame_curr, frame_prev)
-                    gnn_emb_last = self.gnn_encoder(nodes, adj)
-                    
-                    null_emb = self.null_gnn.expand(B, -1).to(torch.bfloat16)
-                    for t in range(self.num_frames - 1):
-                        gnn_stacked[:, t] = null_emb
-                    gnn_stacked[:, -1] = gnn_emb_last
-                
-                else:
-                    gnn_embs = []
-                    for f in range(self.num_frames):
-                        frame_curr = obs_frames[:, f, :]
-                        frame_prev = obs_frames[:, f - 1, :] if f > 0 else frame_curr
-                        nodes, adj = self._parse_frame_to_graph(frame_curr, frame_prev)
-                        gnn_emb = self.gnn_encoder(nodes, adj) 
-                        gnn_embs.append(gnn_emb)
-                    
-                    gnn_stacked = torch.stack(gnn_embs, dim=1)
-                
-                obs_flat = obs_frames.reshape(B * self.num_frames, self.frame_dim)
-                x = self.frame_encoder(obs_flat)
-                x = x.reshape(B, self.num_frames, self.d_model)
-
-                B_orig, T_frames, D_model = x.shape
-                gnn_D_hidden = gnn_stacked.shape[-1]
-
-                x_flat = x.reshape(B_orig * T_frames, D_model)
-                gnn_flat = gnn_stacked.reshape(B_orig * T_frames, gnn_D_hidden)
-
-                x_mod_flat = self.film_layer(x_flat, gnn_flat)
-
-                x = x_mod_flat.view(B_orig, T_frames, D_model)
-            else:
-                obs_flat = obs_frames.reshape(B * self.num_frames, self.frame_dim)
-                x = self.frame_encoder(obs_flat)
-                x = x.reshape(B, self.num_frames, self.d_model)
+        # Frame Encoding - alles in float32, kein autocast
+        obs_flat = obs_frames.reshape(B * self.num_frames, self.frame_dim)
+        x = self.frame_encoder(obs_flat)
+        x = x.reshape(B, self.num_frames, self.d_model)
+        x = F.relu(self.frame_norm(x))
+        
+        # TCN
+        for block in self.tcn_blocks:
+            x = block(x)
+        
+        # *** MEMORY OPTIMIZATION: In-place pooling ***
+        z_tcn = x.mean(dim=1)  # [B, d_model]
+        
+        # Explizit freigeben
+        del x
+        
+        # GNN (nur letzter Frame)
+        if self.use_gnn:
+            frame_curr = obs_frames[:, -1, :]
+            frame_prev = obs_frames[:, -2, :] if self.num_frames > 1 else frame_curr
             
-            x = F.relu(self.frame_norm(x))
+            # Graph computation ohne Gradienten (spart Memory!)
+            with torch.no_grad():
+                nodes, adj = self._parse_frame_to_graph(frame_curr, frame_prev)
             
-            for block in self.tcn_blocks:
-                x = block(x)
+            # Nur GNN Encoder braucht Gradienten
+            z_gnn = self.gnn_encoder(nodes, adj)
             
-            z_tcn_last = x[:, -1, :]
-            
-            z_t = 0.6 * x.mean(dim=1) + 0.4 * x.max(dim=1)[0]
-            
-            if self.use_gnn:
-                x_last = x[:, -1, :]
-                z_gnn_last = self.film_layer(x_last, gnn_stacked[:, -1, :])
-            else:
-                z_gnn_last = z_tcn_last
-            
-        return z_t, z_tcn_last, z_gnn_last
+            # Cleanup
+            del nodes, adj
+        else:
+            z_gnn = torch.zeros(B, self.gnn_hidden, device=device, dtype=torch.float32)
+        
+        return z_tcn, z_gnn
 
     @override(TorchModelV2)
     def forward(self, input_dict: Dict[str, TensorType], state: List[TensorType],
-                seq_lens: TensorType) -> Tuple[TensorType, List[TensorType]]:
+                  seq_lens: TensorType) -> Tuple[TensorType, List[TensorType]]:
 
         obs_flat = input_dict.get("obs_flat", input_dict.get("obs"))
         if obs_flat is None:
@@ -420,14 +362,23 @@ class GFootballGNN(TorchRNN, nn.Module):
 
         obs_frames = obs_flat.view(BT, self.num_frames, self.frame_dim)
 
-        z_t, z_tcn_last, z_gnn_last = self._encode_frames(obs_frames)
+        # Encode Streams
+        z_tcn, z_gnn = self._encode_frames(obs_frames)  # [BT, 96], [BT, 32]
 
-        pa_emb = self.prev_action_embed(prev_actions) 
+        # Previous Action
+        pa_emb = self.prev_action_embed(prev_actions)  # [B, T_max, 16]
         pa_emb_flat = pa_emb.view(BT, self.prev_action_emb_dim)
 
-        gru_in_flat = torch.cat([z_t, pa_emb_flat], dim=-1)
+        # *** MEMORY OPTIMIZATION: Direktes Concat in einem Schritt ***
+        # Keine Bottlenecks, keine .float() Kopien, keine Intermediate Tensoren
+        gru_in_flat = torch.cat([z_tcn, z_gnn, pa_emb_flat], dim=-1)  # [BT, 144]
+        
+        # *** CRITICAL: Sofortige Freigabe nach Concat ***
+        del z_tcn, z_gnn, pa_emb_flat, pa_emb
+        
         gru_in = gru_in_flat.view(B, T_max, self.gru_input_size)
 
+        # GRU
         h_in = state[0].to(device).unsqueeze(0)
         packed_gru_in = nn.utils.rnn.pack_padded_sequence(
             gru_in, seq_lens_cpu_int64, batch_first=True, enforce_sorted=False
@@ -439,27 +390,13 @@ class GFootballGNN(TorchRNN, nn.Module):
         )
 
         gru_out_flat = gru_out.reshape(BT, self.gru_hidden)
+        
+        # *** CRITICAL: GRU intermediate cleanup ***
+        del gru_in, gru_in_flat, packed_gru_in, packed_gru_out, gru_out
 
-        logits_bf16 = None
-        value_bf16 = None
-        
-        with autocast(device_type=device.type, dtype=torch.bfloat16):
-            h_gnn = self.adapt_gnn(z_gnn_last)
-            h_tcn = self.adapt_tcn(z_tcn_last)
-            h_gru = self.adapt_gru(gru_out_flat)
-            
-            temp = self.fuse_temp.clamp(min=0.25, max=4.0)
-            w = torch.softmax(self.fuse_logits / temp, dim=0)
-            
-            h_fused = self.fuse_ln(w[0]*h_gnn + w[1]*h_tcn + w[2]*h_gru)
-            
-            h_fused = self.head_gate(h_fused)
-            
-            logits_bf16 = self.policy_head(self.pi_ln(h_fused))
-            value_bf16 = self.value_head(self.v_ln(h_fused)).squeeze(-1)
-        
-        logits = logits_bf16.float()
-        self._value_out = value_bf16.float()
+        # *** MEMORY OPTIMIZATION: Direkt zu Heads ohne Fusion ***
+        logits = self.policy_head(gru_out_flat)
+        self._value_out = self.value_head(gru_out_flat).squeeze(-1)
 
         new_state = [h_out.squeeze(0).detach()]
         return logits, new_state
