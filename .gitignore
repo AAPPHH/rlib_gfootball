@@ -3,6 +3,8 @@
 /football-venv/
 
 /training_results_transfer/
+/training_results_transfer_mamba/
+/training_results_transfer_mamba_gnn/
 /training_results_transfer_kan/
 /training_results_transfer_day/
 /training_results_transfer_night_2/

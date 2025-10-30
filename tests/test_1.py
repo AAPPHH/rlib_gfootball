@@ -1,7 +1,5 @@
 import torch
+import torch_geometric
 print("PyTorch Version:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-print("CUDA version:", torch.version.cuda)
-print("Number of GPUs:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("GPU Name:", torch.cuda.get_device_name(0))
+print("PyTorch CUDA:", torch.cuda.is_available())
+

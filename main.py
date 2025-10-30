@@ -280,23 +280,31 @@ def create_impala_config(stage: TrainingStage,
     #     }
     # }
     
-
     custom_model_config = {
         "custom_model": "GFootballMamba",
         "max_seq_len": 32,
         "custom_model_config": {
-            "d_model": 48,
-            "prev_action_emb": 8, 
-            "use_kan": True,
-            "kan_grid": 5,
-            "use_gnn": True,
-            "gnn_hidden": 24,
-            "gnn_k": 4,
-            "num_mamba_layers": 2,  
-            "mamba_state": 16,
-            "gradient_checkpointing": True
+                "d_model": 48,
+                "mamba_state": 6,
+                "num_mamba_layers": 2,
+                "gnn_type": "sage",
+                "gnn_layers": 2,
+                "gnn_hidden": 24,
+                "gnn_output": 48,
+                "gnn_k_neighbors": 4,
+                "include_ball_node": True,
+                "include_global_node": True,
+                "include_team_nodes": True,
+                "include_possession_node": False,
+                "include_action_node": False,
+                "gnn_dropout": 0.05,
+                "kan_grid": 5,
+                "kan_hidden_dim": 32,
+                "kan_dropout": 0.0,
+                "prev_action_emb": 8,
+                "gradient_checkpointing": True,
+            },
         }
-    }
 
     standard_model_config = {
         "fcnet_hiddens": [256, 256, 256], 
