@@ -26,6 +26,8 @@ from model_2 import GFootballGNN
 
 from policy_pool import EnhancedSelfPlayCallback
 
+import os
+
 @dataclass
 class TrainingStage:
     name: str
@@ -39,10 +41,10 @@ class TrainingStage:
 
 TRAINING_STAGES = [
     # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    # TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 1, 0, 1.0, 50_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
     # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
     # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
     # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
@@ -51,12 +53,15 @@ TRAINING_STAGES = [
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
+        ray_temp = os.environ.get('RAY_TEMP_DIR', '/tmp')
+        gf_logdir = os.path.join(ray_temp, 'gf')
+        
         default_config = {
             "env_name": "11_vs_11_stochastic", "representation": "simple115v2",
             "rewards": "scoring,checkpoints", "number_of_left_players_agent_controls": 1,
             "number_of_right_players_agent_controls": 0,
             "stacked": True,
-            "logdir": "/tmp/gfootball", "write_goal_dumps": False,
+            "logdir": gf_logdir, "write_goal_dumps": False,
             "write_full_episode_dumps": False, "render": False,
             "write_video": False, "dump_frequency": 1,
         }
@@ -237,6 +242,7 @@ def create_impala_config(stage: TrainingStage,
     config.env_runners(
         num_env_runners=0 if debug_mode else tune_config["num_env_runners"],
         num_envs_per_env_runner=1,
+        num_gpus_per_env_runner=0, 
         num_cpus_per_env_runner=tune_config["cpus_per_runner"],
         rollout_fragment_length=128 if not debug_mode else 8,
         batch_mode="truncate_episodes"
@@ -322,15 +328,13 @@ def create_impala_config(stage: TrainingStage,
         config.model.update(standard_model_config)
 
     config.resources(
-        num_gpus=tune_config["gpu_per_trial"],
-        num_cpus_for_main_process=2
+        num_cpus_for_main_process=10
     )
     config.learners(
         num_learners=1,
         num_gpus_per_learner=tune_config["gpu_per_trial"],
         num_cpus_per_learner=1
     )
-
 
     policies = {}
     has_left = stage.left_players > 0
@@ -553,10 +557,11 @@ def train_stage_sequential_pbt(
         base_cfg["lr"]            = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["lr"])
         base_cfg["entropy_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["entropy_coeff"])
         base_cfg["vf_loss_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["vf_loss_coeff"])
-
+        num_env_runners = 0 if debug_mode else tune_config["num_env_runners"]
         resources_per_trial = tune.PlacementGroupFactory(
-            [{"CPU": 2, "GPU": tune_config["gpu_per_trial"]}] +
-            [{"CPU": tune_config["cpus_per_runner"]}] * (0 if debug_mode else tune_config["num_env_runners"])
+            [{"CPU": 2}] +
+            [{"CPU": 1, "GPU": tune_config["gpu_per_trial"]}] + 
+            [{"CPU": tune_config["cpus_per_runner"]}] * num_env_runners
         )
 
         gen_results_path = results_path / stage.name / f"gen_{gen+1}"
@@ -749,8 +754,8 @@ def main():
         tune_config = {
             "num_trials": 1,
             "max_concurrent": 1,
-            "gpu_per_trial": 1.0,
-            "num_env_runners": 22,
+            "gpu_per_trial": 1,
+            "num_env_runners": 370,
             "cpus_per_runner": 1,
             "candidates_per_gen": 3,
             "steps_per_gen": 1_000_000,
@@ -774,7 +779,7 @@ def main():
     debug_mode = False
     initial_checkpoint =None
 
-    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode)
+    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="auto")
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())
 

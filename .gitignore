@@ -1,7 +1,7 @@
 /__pycache__/
 
 /football-venv/
-
+/ray_*/
 /training_results_transfer/
 /training_results_transfer_mamba/
 /training_results_transfer_mamba_gnn/
@@ -11,3 +11,5 @@
 /training_results_transfer_pbt_2/
 /training_results_transfer_gold/
 /training_results_transfer27_10/
+*.err
+*.out
