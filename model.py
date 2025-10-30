@@ -428,27 +428,35 @@ class GFootballMamba(TorchRNN, nn.Module):
                 all_edges_list.extend(add_batched_edges(idx_l, node_indices['ball_idx']))
                 all_edges_list.extend(add_batched_edges(idx_r, node_indices['ball_idx']))
         if self.include_possession_node:
-             idx = node_indices['poss_idx']
-             if self.include_ball_node:
-                 all_edges_list.extend(add_batched_edges(idx, node_indices['ball_idx'], self_loop=True))
-             else:
-                 all_edges_list.extend(add_batched_edges(idx, idx, self_loop=True))
+            idx = node_indices['poss_idx']
+            if self.include_ball_node:
+                all_edges_list.extend(add_batched_edges(idx, node_indices['ball_idx'], self_loop=True))
+            else:
+                all_edges_list.extend(add_batched_edges(idx, idx, self_loop=True))
         if self.include_action_node:
             idx = node_indices['action_idx']
             all_edges_list.extend(add_batched_edges(idx, left_player_indices_rel, self_loop=True))
             if self.include_ball_node:
-                 all_edges_list.extend(add_batched_edges(idx, node_indices['ball_idx']))
+                all_edges_list.extend(add_batched_edges(idx, node_indices['ball_idx']))
         if self.include_global_node:
             idx = node_indices['global_idx']
             all_other_nodes_rel = all_node_indices_rel[all_node_indices_rel != idx]
             all_edges_list.extend(add_batched_edges(idx, all_other_nodes_rel, self_loop=True))
             if self.include_team_nodes:
-                 all_edges_list.extend(add_batched_edges(idx, node_indices['left_team_idx']))
-                 all_edges_list.extend(add_batched_edges(idx, node_indices['right_team_idx']))
+                all_edges_list.extend(add_batched_edges(idx, node_indices['left_team_idx']))
+                all_edges_list.extend(add_batched_edges(idx, node_indices['right_team_idx']))
 
         edge_index = torch.cat(all_edges_list, dim=1)
         x_norm = self.node_feature_norm(x_flat_nodes)
-        graph_embeddings = self.gnn_encoder(x_norm, edge_index, batch_pyg)
+        
+        # --- START: MODIFIZIERTER GNN-AUFRUF ---
+        if self.use_checkpoint and self.training:
+            # `use_reentrant=False` ist oft effizienter und für die meisten GNNs sicher
+            graph_embeddings = checkpoint(self.gnn_encoder, x_norm, edge_index, batch_pyg, use_reentrant=False)
+        else:
+            graph_embeddings = self.gnn_encoder(x_norm, edge_index, batch_pyg)
+        # --- ENDE: MODIFIZIERTER GNN-AUFRUF ---
+            
         return graph_embeddings
 
     @override(TorchModelV2)
@@ -489,6 +497,8 @@ class GFootballMamba(TorchRNN, nn.Module):
 
         obs_frames = obs_flat.view(BT, self.num_frames, self.frame_dim)
         
+        # --- START: MODIFIZIERTER AUTOCAST-BLOCK ---
+        # Der autocast-Block umschließt jetzt ALLES, inklusive der KAN-Köpfe
         with autocast(enabled=AMP_AVAILABLE and device.type == 'cuda', dtype=torch.bfloat16):
             gnn_features = self._extract_graph_features(obs_frames)
             pa_emb = self.prev_action_embed(prev_actions.view(BT))
@@ -524,22 +534,27 @@ class GFootballMamba(TorchRNN, nn.Module):
                 mask_flat_val = seq_mask.reshape(BT, 1).to(x_flat_value.dtype)
                 x_flat_value = x_flat_value * mask_flat_val
         
-        
-        x_flat_policy_c = torch.clamp(x_flat_policy.float(), -10.0, 10.0)
-        logits = self.policy_head(x_flat_policy_c)
-        
-        x_flat_value_c = torch.clamp(x_flat_value.float(), -10.0, 10.0)
-        v_raw = self.value_kan(x_flat_value_c)
-        value = self.value_output(v_raw) * self.value_scale
-        
+            x_flat_policy_c = torch.clamp(x_flat_policy, -10.0, 10.0)
+            x_flat_value_c = torch.clamp(x_flat_value, -10.0, 10.0)
+
+            if self.use_checkpoint and self.training:
+                logits_raw = checkpoint(self.policy_head, x_flat_policy_c, use_reentrant=False)
+                v_raw = checkpoint(self.value_kan, x_flat_value_c, use_reentrant=False)
+            else:
+                logits_raw = self.policy_head(x_flat_policy_c)
+                v_raw = self.value_kan(x_flat_value_c)
+
+            logits = logits_raw.float() 
+            value = self.value_output(v_raw.float()) * self.value_scale
+            
         self._value_out = value.squeeze(-1)
 
         if "action_mask" in input_dict:
             action_mask = input_dict["action_mask"].float()
             if action_mask.shape[0] != BT:
-                 action_mask_unpadded = torch.split(action_mask, seq_lens.tolist())
-                 action_mask_padded = nn.utils.rnn.pad_sequence(action_mask_unpadded, batch_first=True, padding_value=0.0)
-                 action_mask = action_mask_padded.view(BT, -1)
+                action_mask_unpadded = torch.split(action_mask, seq_lens.tolist())
+                action_mask_padded = nn.utils.rnn.pad_sequence(action_mask_unpadded, batch_first=True, padding_value=0.0)
+                action_mask = action_mask_padded.view(BT, -1)
             
             all_zero = (action_mask.sum(dim=1) == 0)
             if all_zero.any():
@@ -549,7 +564,7 @@ class GFootballMamba(TorchRNN, nn.Module):
             logits = logits + inf_mask
         
         if torch.isnan(logits).any() or torch.isinf(logits).any():
-             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e9, neginf=-1e9)
 
         return logits, new_states
 
