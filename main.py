@@ -328,7 +328,8 @@ def create_impala_config(stage: TrainingStage,
         config.model.update(standard_model_config)
 
     config.resources(
-        num_cpus_for_main_process=1
+        num_cpus_for_main_process=1,
+        num_gpus=0
     )
     config.learners(
         num_learners=1,
@@ -661,9 +662,16 @@ def train_single_stage(stage: TrainingStage,
 
     num_runners = 0 if debug_mode else tune_config["num_env_runners"]
     gpus_for_learner = tune_config["gpu_per_trial"]
-    cpus_for_learner_and_driver = 2
+    
+    cpus_for_learner = 1 
+    cpus_for_driver = 2 
+
     resources_per_trial = tune.PlacementGroupFactory(
-        [{"CPU": cpus_for_learner_and_driver, "GPU": gpus_for_learner}] +
+        [
+            {"CPU": cpus_for_driver, "GPU": 0}, 
+            
+            {"CPU": cpus_for_learner, "GPU": gpus_for_learner},
+        ] +
         [{"CPU": tune_config["cpus_per_runner"]}] * num_runners
     )
 
@@ -746,7 +754,7 @@ def train_single_stage(stage: TrainingStage,
         return None
 
 def main():
-    scheduler_mode = "pbt_sequential"
+    scheduler_mode = "pbt_parallel"
     
     tune_config = None
     if scheduler_mode == "pbt_sequential":
@@ -765,9 +773,9 @@ def main():
             "num_trials": 2,
             "max_concurrent": 2,
             "gpu_per_trial": 0.5,
-            "num_env_runners": 10,
+            "num_env_runners": 9,
             "cpus_per_runner": 1,
-            "perturbation_interval": 50_000,
+            "perturbation_interval": 1_000_000,
         }
     else:
         raise ValueError(f"Unknown SCHEDULER_MODE: {scheduler_mode}")
