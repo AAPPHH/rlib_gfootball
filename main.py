@@ -754,7 +754,7 @@ def train_single_stage(stage: TrainingStage,
         return None
 
 def main():
-    scheduler_mode = "pbt_parallel"
+    scheduler_mode = "pbt_sequential"
     
     tune_config = None
     if scheduler_mode == "pbt_sequential":

@@ -2,6 +2,7 @@
 
 /football-venv/
 /ray_*/
+/cold_start/
 /training_results_transfer/
 /training_results_transfer_mamba/
 /training_results_transfer_mamba_gnn/
