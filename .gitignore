@@ -2,7 +2,6 @@
 
 /football-venv/
 /ray_*/
-/cold_start/
 /training_results_transfer/
 /training_results_transfer_mamba/
 /training_results_transfer_mamba_gnn/
@@ -12,5 +11,10 @@
 /training_results_transfer_pbt_2/
 /training_results_transfer_gold/
 /training_results_transfer27_10/
+
+/cold_start/archive (1)/
+/cold_start/ducklake/
+/cold_start/xgboost_tuned/
+
 *.err
 *.out

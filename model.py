@@ -14,9 +14,6 @@ from ray.rllib.utils.typing import ModelConfigDict, TensorType
 from ray.rllib.policy.view_requirement import ViewRequirement
 
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv, global_mean_pool, global_add_pool
-from torch_geometric.data import Data, Batch
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import add_self_loops, degree
 from torch_geometric.nn.pool import knn_graph
 
 try:
