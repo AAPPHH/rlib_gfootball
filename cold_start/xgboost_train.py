@@ -92,7 +92,7 @@ class XGBoostMemorizationTuner:
         # Hyperparameter search space
         params = {
             'n_estimators': trial.suggest_int('n_estimators', 500, 2000, step=100),
-            'max_depth': trial.suggest_int('max_depth', 8, 20),
+            'max_depth': trial.suggest_int('max_depth', 8, 16),
             'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.3, log=True),
             'subsample': trial.suggest_float('subsample', 0.7, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
