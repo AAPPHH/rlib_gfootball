@@ -223,7 +223,6 @@ class DuckDBLakeBuilder:
                 logger.info(f"Removing existing database: {self.db_path}")
                 self.db_path.unlink()
             
-            # Process all JSON files
             all_obs = []
             all_act = []
             all_rew = []
@@ -283,13 +282,9 @@ class DuckDBLakeBuilder:
                 rew_count = conn.execute("SELECT COUNT(*) FROM rewards").fetchone()[0]
                 logger.info(f"✓ Imported {rew_count:,} rewards")
                 
-                # --- KORREKTUR ENDE ---
-
-                # Create stacked features view if needed
                 if self.stack_frames > 1:
                     logger.info(f"\n🔄 Creating {self.stack_frames}x stacked features view...")
                     
-                    # Get feature columns
                     sample = conn.execute("SELECT * FROM observations LIMIT 1").df()
                     feature_cols = [c for c in sample.columns if c.startswith('feat_')]
                     n_base_features = len(feature_cols)
@@ -297,7 +292,6 @@ class DuckDBLakeBuilder:
                     if n_base_features == 0:
                         logger.warning("No 'feat_' columns found in observations, skipping stacking.")
                     else:
-                        # Build lag clauses
                         lag_clauses = []
                         for offset in range(self.stack_frames):
                             for col in feature_cols:
@@ -312,7 +306,6 @@ class DuckDBLakeBuilder:
                                     )
                                     lag_clauses.append(lag_clause)
                         
-                        # Create the stacked view
                         conn.execute(f"""
                             CREATE VIEW observations_stacked AS
                             SELECT 
@@ -325,7 +318,6 @@ class DuckDBLakeBuilder:
                         
                         logger.info(f"✓ Created stacked view with {n_base_features * self.stack_frames} features")
                 
-                # Create indices for faster querying
                 logger.info("\n🔧 Creating indices...")
                 conn.execute("CREATE INDEX idx_obs_global ON observations(global_idx)")
                 conn.execute("CREATE INDEX idx_obs_replay ON observations(replay_id, step)")
@@ -334,7 +326,6 @@ class DuckDBLakeBuilder:
                 conn.execute("CREATE INDEX idx_rew_global ON rewards(global_idx)")
                 conn.execute("CREATE INDEX idx_rew_replay ON rewards(replay_id, step)")
                 
-                # Compute statistics
                 logger.info("\n📊 Computing statistics...")
                 stats = conn.execute("""
                     SELECT 
@@ -347,7 +338,6 @@ class DuckDBLakeBuilder:
                         (SELECT AVG(step) FROM observations) as avg_step
                 """).df()
                 
-                # Create metadata table
                 conn.execute(f"""
                     CREATE TABLE metadata AS 
                     SELECT 
@@ -362,7 +352,6 @@ class DuckDBLakeBuilder:
                 
                 elapsed = time.time() - start_time
                 
-                # Print summary
                 logger.info("\n" + "="*70)
                 logger.info("✅ DuckDB Lake Created Successfully!")
                 logger.info("="*70)
@@ -385,7 +374,6 @@ class DuckDBLakeBuilder:
                     logger.info(f"\nAvailable views:")
                     logger.info(f"  - observations_stacked: {self.stack_frames}x stacked features")
                 
-                # Save quick access queries
                 queries_file = self.output_dir / "example_queries.sql"
                 with open(queries_file, 'w') as f:
                     f.write(f"""-- Example DuckDB Queries for the Replay Lake
@@ -436,11 +424,9 @@ def main():
         db_path = builder.build_lake()
         
         if db_path:
-            # Test the connection
             print("\n🔍 Testing database connection...")
             conn = duckdb.connect(str(db_path), read_only=True)
             
-            # Quick test query
             result = conn.execute("SELECT COUNT(*) as total FROM observations").fetchone()
             print(f"✓ Database accessible: {result[0]:,} observations")
             

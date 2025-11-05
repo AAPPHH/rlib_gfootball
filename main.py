@@ -313,10 +313,10 @@ def create_impala_config(stage: TrainingStage,
         }
 
     standard_model_config = {
-        "fcnet_hiddens": [256, 256, 256], 
+        "fcnet_hiddens": [512, 512], 
         "fcnet_activation": "silu", 
         "use_lstm": True, 
-        "lstm_cell_size": 256, 
+        "lstm_cell_size": 512, 
         "lstm_use_prev_action": True, 
         "lstm_use_prev_reward": False, 
         "vf_share_layers": True, 
