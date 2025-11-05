@@ -113,7 +113,8 @@ class XGBoostMemorizationTuner:
             'eval_metric': 'mlogloss',
             'random_state': 42,
             'verbosity': 0,
-            'n_jobs': -1
+            'n_jobs': -1,
+            'bins': 128
         })
         
         kf = KFold(n_splits=3, shuffle=True, random_state=42)
@@ -213,8 +214,6 @@ class XGBoostMemorizationTuner:
             'random_state': 42,
             'verbosity': 1,
             'n_jobs': -1,
-            "bins": 128
-
         })
         
         if final_params['n_estimators'] < 1500:
@@ -227,7 +226,7 @@ class XGBoostMemorizationTuner:
                           'eval_metric', 'random_state', 'verbosity', 'n_jobs']:
                 logger.info(f"  {key}: {value}")
 
-        model = xgb.XGBClassifier(**final_params, early_stopping_rounds=5)
+        model = xgb.XGBClassifier(**final_params, early_stopping_rounds=50)
         
         n_val = min(10000, int(len(X) * 0.05))
         indices = np.random.permutation(len(X))
