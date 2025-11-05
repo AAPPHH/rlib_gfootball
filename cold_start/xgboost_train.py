@@ -213,6 +213,7 @@ class XGBoostMemorizationTuner:
             'random_state': 42,
             'verbosity': 1,
             'n_jobs': -1,
+            "bins": 128
 
         })
         
@@ -226,7 +227,7 @@ class XGBoostMemorizationTuner:
                           'eval_metric', 'random_state', 'verbosity', 'n_jobs']:
                 logger.info(f"  {key}: {value}")
 
-        model = xgb.XGBClassifier(**final_params)
+        model = xgb.XGBClassifier(**final_params, early_stopping_rounds=5)
         
         n_val = min(10000, int(len(X) * 0.05))
         indices = np.random.permutation(len(X))
@@ -323,7 +324,7 @@ def main():
     DUCKLAKE_PATH = r"C:\clones\rlib_gfootball\cold_start\ducklake\replay_lake.duckdb"
     OUTPUT_DIR = r"C:\clones\rlib_gfootball\cold_start\xgboost_tuned"
     STACK_FRAMES = 4
-    N_TRIALS = 1
+    N_TRIALS = 50
     
     tuner = XGBoostMemorizationTuner(DUCKLAKE_PATH, OUTPUT_DIR, STACK_FRAMES)
     model_path, accuracy = tuner.run_full_pipeline(n_trials=N_TRIALS)
