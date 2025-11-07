@@ -1,9 +1,3 @@
-"""
-Step 2: XGBoost Hyperparameter Tuning with FIXED Early Stopping
-Trains XGBoost on ALL data (no test split) to achieve maximum memorization
-Uses Optuna for hyperparameter optimization
-"""
-
 import duckdb
 import numpy as np
 import xgboost as xgb
@@ -87,12 +81,9 @@ class XGBoostMemorizationTuner:
         return X, y
     
     def objective(self, trial, X, y):
-        """Optuna objective function with PROPER early stopping"""
-        
-        # Hyperparameter search space
         params = {
             'n_estimators': trial.suggest_int('n_estimators', 500, 2000, step=100),
-            'max_depth': trial.suggest_int('max_depth', 8, 16),
+            'max_depth': trial.suggest_int('max_depth', 8, 20),
             'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.3, log=True),
             'subsample': trial.suggest_float('subsample', 0.7, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
@@ -114,10 +105,10 @@ class XGBoostMemorizationTuner:
             'random_state': 42,
             'verbosity': 0,
             'n_jobs': -1,
-            'bins': 128
+            'bins': 256
         })
         
-        kf = KFold(n_splits=3, shuffle=True, random_state=42)
+        kf = KFold(n_splits=10, shuffle=True, random_state=42)
         accuracies = []
         best_iterations = []
         
@@ -320,8 +311,8 @@ class XGBoostMemorizationTuner:
         return model_path, accuracy
 
 def main():
-    DUCKLAKE_PATH = r"C:\clones\rlib_gfootball\cold_start\ducklake\replay_lake.duckdb"
-    OUTPUT_DIR = r"C:\clones\rlib_gfootball\cold_start\xgboost_tuned"
+    DUCKLAKE_PATH = r"/home/john/rlib_gfootball/cold_start/ducklake/replay_lake.duckdb"
+    OUTPUT_DIR = r"/home/john/rlib_gfootball/cold_start/nvidixgboost_tuned"
     STACK_FRAMES = 4
     N_TRIALS = 50
     

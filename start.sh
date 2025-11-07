@@ -6,6 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --cpus-per-task=96
 #SBATCH --mem-per-cpu=9GB
+#SBATCH --gpus-per-node=8
 #SBATCH --time=90-00:00:00
 #SBATCH --output=/home/john/rlib_gfootball/ray_%j.out
 #SBATCH --error=/home/john/rlib_gfootball/ray_%j.err
@@ -16,12 +17,12 @@ set -x
 
 # Initialize conda
 source /home/john/miniforge/etc/profile.d/conda.sh
-conda activate football
+conda activate base
 
 # Remove ~/.local/bin from PATH and ensure conda env is first
 export PATH=$(echo $PATH | tr ':' '\n' | grep -v "^/home/john/.local/bin$" | tr '\n' ':' | sed 's/:$//')
-export PATH="/home/john/miniforge/envs/football/bin:$PATH"
-export LD_LIBRARY_PATH="/home/john/miniforge/envs/football/lib:${LD_LIBRARY_PATH}"
+export PATH="/home/john/miniforge/envs/football_cuda/bin:$PATH"
+export LD_LIBRARY_PATH="/home/john/miniforge/envs/football_cuda/lib:${LD_LIBRARY_PATH}"
 
 # Verify we're using the correct versions
 echo "=== Version Check ==="
@@ -75,9 +76,9 @@ echo "IP Head: $ip_head"
 echo "Starte HEAD auf $head_node"
 
 srun --nodes=1 --ntasks=1 -w "$head_node" bash <<EOFHEAD &
-export PATH="/home/john/miniforge/envs/football/bin:\$PATH"
-export LD_LIBRARY_PATH="/home/john/miniforge/envs/football/lib:\$LD_LIBRARY_PATH"
-/home/john/miniforge/envs/football/bin/ray start --head \
+export PATH="/home/john/miniforge/envs/football_cuda/bin:\$PATH"
+export LD_LIBRARY_PATH="/home/john/miniforge/envs/football_cuda/lib:\$LD_LIBRARY_PATH"
+/home/john/miniforge/envs/football_cuda/bin/ray start --head \
     --node-ip-address='$head_node_ip' \
     --port=$port \
     --dashboard-host=0.0.0.0 \
@@ -98,8 +99,8 @@ for ((i = 1; i <= worker_num; i++)); do
     echo "Starte WORKER $i auf $node_i mit IP $node_ip"
     
     srun --nodes=1 --ntasks=1 -w "$node_i" bash <<EOFWORKER &
-export PATH="/home/john/miniforge/envs/football/bin:\$PATH"
-export LD_LIBRARY_PATH="/home/john/miniforge/envs/football/lib:\$LD_LIBRARY_PATH"
+export PATH="/home/john/miniforge/envs/football_cuda/bin:\$PATH"
+export LD_LIBRARY_PATH="/home/john/miniforge/envs/football_cuda/lib:\$LD_LIBRARY_PATH"
 
 # Real storage auf gemounteten Speicher
 BASE_STORAGE=$BASE_STORAGE
@@ -113,7 +114,7 @@ export RAY_TEMP_DIR=\$SHORT_LINK
 
 echo "Worker $node_i: Storage=\$BASE_STORAGE/$node_i, Link=\$SHORT_LINK"
 
-/home/john/miniforge/envs/football/bin/ray start --address='$ip_head' \
+/home/john/miniforge/envs/football_cuda/bin/ray start --address='$ip_head' \
     --node-ip-address='$node_ip' \
     --num-cpus=${SLURM_CPUS_PER_TASK} \
     --num-gpus=${SLURM_GPUS_PER_TASK} \
@@ -133,22 +134,22 @@ echo "Starte GPU Worker-Node aus der GPU-Partition..."
 GPU_WORKER_JOB=$(sbatch --parsable <<EOFGPU
 #!/bin/bash
 #SBATCH --job-name=ray_gpu_worker_${SLURM_JOB_ID}
-#SBATCH --partition=GPU
+#SBATCH --partition=mobile
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=96
-#SBATCH --gres=gpu:2
-#SBATCH --mem-per-cpu=9GB
+#SBATCH --cpus-per-task=256
+#SBATCH --gres=gpu:1
+#SBATCH --mem-per-cpu=6GB
 #SBATCH --time=90-00:00:00
 #SBATCH --output=/home/john/rlib_gfootball/ray_gpu_worker_${SLURM_JOB_ID}_%j.out
 #SBATCH --error=/home/john/rlib_gfootball/ray_gpu_worker_${SLURM_JOB_ID}_%j.err
 
 source /home/john/miniforge/etc/profile.d/conda.sh
-conda activate football
+conda activate football_cuda
 
 export PATH=\$(echo \$PATH | tr ':' '\n' | grep -v "^/home/john/.local/bin\$" | tr '\n' ':' | sed 's/:\$//')
-export PATH="/home/john/miniforge/envs/football/bin:\$PATH"
-export LD_LIBRARY_PATH="/home/john/miniforge/envs/football/lib:\${LD_LIBRARY_PATH}"
+export PATH="/home/john/miniforge/envs/football_cuda/bin:\$PATH"
+export LD_LIBRARY_PATH="/home/john/miniforge/envs/football_cuda/lib:\${LD_LIBRARY_PATH}"
 
 # Real storage auf gemounteten Speicher
 BASE_STORAGE=/home/john/rlib_gfootball/ray_temp_${SLURM_JOB_ID}
@@ -179,10 +180,10 @@ echo "======================"
 ping -c 3 $head_node_ip && echo "✓ Head reachable" || echo "✗ Cannot reach head!"
 
 echo "Starting Ray worker..."
-/home/john/miniforge/envs/football/bin/ray start --address='$ip_head' \
+/home/john/miniforge/envs/football_cuda/bin/ray start --address='$ip_head' \
     --node-ip-address="\$GPU_NODE_IP" \
-    --num-cpus=96 \
-    --num-gpus=2 \
+    --num-cpus=256 \
+    --num-gpus=1 \
     --temp-dir='\$SHORT_LINK' \
     --block
 EOFGPU

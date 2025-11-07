@@ -415,8 +415,8 @@ class DuckDBLakeBuilder:
 
 
 def main():
-    REPLAY_DIR = r"C:\clones\rlib_gfootball\cold_start\archive (1)" 
-    OUTPUT_DIR = r"C:\clones\rlib_gfootball\cold_start\ducklake"
+    REPLAY_DIR = r"/home/john/rlib_gfootball/cold_start/archive" 
+    OUTPUT_DIR = r"/home/john/rlib_gfootball/cold_start/ducklake"
     STACK_FRAMES = 4
     
     try:

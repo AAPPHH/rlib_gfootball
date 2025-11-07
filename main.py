@@ -41,10 +41,10 @@ class TrainingStage:
 
 TRAINING_STAGES = [
     # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    # TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1.0, 50_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 500_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
     # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
     # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
     # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
@@ -256,15 +256,14 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 1.0),
         grad_clip=0.5,
-        train_batch_size=32_768,
+        train_batch_size=128_000,
         learner_queue_size=32,
-        max_requests_in_flight_per_aggregator_worker=6,
         num_sgd_iter=1,
         vtrace_clip_rho_threshold=1.0,
         vtrace_clip_pg_rho_threshold=1.0
     )
 
-    use_custom_model =True
+    use_custom_model = False
     
     # custom_model_config = {
     #     "custom_model": "GFootballGNN",
@@ -558,10 +557,17 @@ def train_stage_sequential_pbt(
         base_cfg["lr"]            = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["lr"])
         base_cfg["entropy_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["entropy_coeff"])
         base_cfg["vf_loss_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["vf_loss_coeff"])
+        
         num_env_runners = 0 if debug_mode else tune_config["num_env_runners"]
+        
         resources_per_trial = tune.PlacementGroupFactory(
-            [{"CPU": 2, "GPU": tune_config["gpu_per_trial"]}] +
-            [{"CPU": tune_config["cpus_per_runner"]}] * (0 if debug_mode else tune_config["num_env_runners"])
+            [
+                {"CPU": 1},
+                {"CPU": 1, "GPU": tune_config["gpu_per_trial"]},
+            ] + [
+                {"CPU": tune_config["cpus_per_runner"]}
+            ] * num_env_runners,
+            strategy="SPREAD"
         )
 
         gen_results_path = results_path / stage.name / f"gen_{gen+1}"
@@ -590,11 +596,11 @@ def train_stage_sequential_pbt(
         )
 
         try:
-             results = tuner.fit()
+            results = tuner.fit()
         except Exception as e:
-             print(f"ERROR during tuner.fit() for Gen {gen+1}: {e}")
-             print("Stopping PBT for this stage.")
-             break
+            print(f"ERROR during tuner.fit() for Gen {gen+1}: {e}")
+            print("Stopping PBT for this stage.")
+            break
 
         if results.num_errors > 0:
             print(f"⚠️ [SeqPBT] Generation {gen+1} finished with {results.num_errors} error(s).")
@@ -672,7 +678,8 @@ def train_single_stage(stage: TrainingStage,
             
             {"CPU": cpus_for_learner, "GPU": gpus_for_learner},
         ] +
-        [{"CPU": tune_config["cpus_per_runner"]}] * num_runners
+        [{"CPU": tune_config["cpus_per_runner"]}] * num_runners,
+        strategy="SPREAD"
     )
 
     stop_criteria = {"timesteps_total": stage.max_timesteps}
@@ -762,10 +769,10 @@ def main():
             "num_trials": 1,
             "max_concurrent": 1,
             "gpu_per_trial": 1,
-            "num_env_runners": 22,
+            "num_env_runners": 540,
             "cpus_per_runner": 1,
             "candidates_per_gen": 3,
-            "steps_per_gen": 1_000_000,
+            "steps_per_gen": 10_000_000,
         }
 
     elif scheduler_mode == "pbt_parallel":
@@ -786,7 +793,7 @@ def main():
     debug_mode = False
     initial_checkpoint =None
 
-    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
+    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="auto")
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())
 
