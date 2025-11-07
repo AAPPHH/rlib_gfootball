@@ -6,7 +6,7 @@ import optuna
 from optuna.samplers import TPESampler
 import time
 import pickle
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 import gc
 import logging
 
@@ -25,15 +25,13 @@ class XGBoostMemorizationTuner:
             raise FileNotFoundError(f"DuckDB lake not found: {self.ducklake_path}")
         
         logger.info("="*70)
-        logger.info("XGBoost Memorization Tuner (with FIXED Early Stopping)")
+        logger.info("XGBoost Cold-Start Policy Tuner")
         logger.info("="*70)
         logger.info(f"Database: {ducklake_path}")
         logger.info(f"Output: {output_dir}")
-        logger.info(f"Stack frames: {stack_frames}")
-        logger.info("Goal: Maximum memorization (100% accuracy)\n")
+        logger.info(f"Stack frames: {stack_frames}\n")
     
     def load_full_dataset(self):
-        """Load entire dataset from DuckDB lake"""
         logger.info("Loading full dataset from DuckDB lake...")
         start = time.time()
         
@@ -42,16 +40,14 @@ class XGBoostMemorizationTuner:
         conn.execute("SET memory_limit = '32GB'")
         
         try:
-            # Determine which table/view to use
             if self.stack_frames > 1:
                 obs_table = "observations_stacked"
             else:
                 obs_table = "observations"
             
-            # Load all features and actions
             query = f"""
                 SELECT 
-                    o.* EXCLUDE (global_idx, replay_id, step),
+                    o.*,
                     a.action
                 FROM {obs_table} o
                 JOIN actions a ON o.global_idx = a.global_idx
@@ -60,11 +56,10 @@ class XGBoostMemorizationTuner:
             
             data = conn.execute(query).df()
             
-            # Split into X and y
-            X = data.drop('action', axis=1).values.astype(np.float32)
-            y = data['action'].values.astype(np.int32)
+            groups = data["replay_id"].values
+            X = data.drop(columns=["action", "replay_id", "global_idx", "step"], errors="ignore").values.astype(np.float32)
+            y = data["action"].values.astype(np.int32)
             
-            # Clean data
             X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
             
             elapsed = time.time() - start
@@ -73,27 +68,29 @@ class XGBoostMemorizationTuner:
             logger.info(f"  Shape: {X.shape}")
             logger.info(f"  Features: {X.shape[1]}")
             logger.info(f"  Classes: {len(np.unique(y))}")
+            logger.info(f"  Replays: {len(np.unique(groups))}")
             logger.info(f"  Memory: {X.nbytes / 1e9:.2f} GB\n")
             
         finally:
             conn.close()
         
-        return X, y
+        return X, y, groups
     
-    def objective(self, trial, X, y):
+    def objective(self, trial, X, y, groups):
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000, step=100),
-            'max_depth': trial.suggest_int('max_depth', 8, 20),
-            'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.3, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 400, 1600, step=100),
+            'max_depth': trial.suggest_int('max_depth', 3, 7),
+            'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.2, log=True),
             'subsample': trial.suggest_float('subsample', 0.7, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
-            'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.7, 1.0),
-            'colsample_bynode': trial.suggest_float('colsample_bynode', 0.7, 1.0),
-            'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 2.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 1.0),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 5),
-            'gamma': trial.suggest_float('gamma', 0.0, 0.2),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'colsample_bylevel': trial.suggest_float('colsample_bylevel', 0.6, 1.0),
+            'colsample_bynode': trial.suggest_float('colsample_bynode', 0.6, 1.0),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1.0, 10.0, log=True),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 5.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 5, 30),
+            'gamma': trial.suggest_float('gamma', 0.0, 2.0),
             'max_delta_step': trial.suggest_float('max_delta_step', 0, 5),
+            'max_bin': trial.suggest_int('max_bin', 256, 256),
         }
         
         params.update({
@@ -104,25 +101,25 @@ class XGBoostMemorizationTuner:
             'eval_metric': 'mlogloss',
             'random_state': 42,
             'verbosity': 0,
-            'n_jobs': -1,
-            'bins': 256
+            'n_jobs': 0
         })
         
-        kf = KFold(n_splits=10, shuffle=True, random_state=42)
+        gkf = GroupKFold(n_splits=5)
         accuracies = []
         best_iterations = []
         
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_fold = X[train_idx]
-            y_fold = y[train_idx]
-            X_val_fold = X[val_idx]
-            y_val_fold = y[val_idx]
+        for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+            X_train = X[train_idx]
+            y_train = y[train_idx]
+            X_val = X[val_idx]
+            y_val = y[val_idx]
             
-            model = xgb.XGBClassifier(**params, early_stopping_rounds=5)
+            model = xgb.XGBClassifier(**params, early_stopping_rounds=50)
             
             model.fit(
-                X_fold, y_fold,
-                eval_set=[(X_val_fold, y_val_fold)],
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False
             )
             
             if hasattr(model, 'best_iteration') and model.best_iteration is not None:
@@ -132,7 +129,7 @@ class XGBoostMemorizationTuner:
             else:
                 logger.debug(f"Fold {fold+1}: Used all {params['n_estimators']} iterations")
             
-            acc = model.score(X_val_fold, y_val_fold)
+            acc = model.score(X_val, y_val)
             accuracies.append(acc)
             
             del model
@@ -152,18 +149,28 @@ class XGBoostMemorizationTuner:
         
         return np.mean(accuracies)
     
-    def tune_hyperparameters(self, X, y, n_trials=100):
+    def tune_hyperparameters(self, X, y, groups, n_trials=100):
         logger.info(f"Starting Optuna optimization with {n_trials} trials...")
-        logger.info("Using 3-fold CV with early stopping (patience=50)\n")
+        logger.info("Using 5-fold GroupKFold (replay-separated) with early stopping\n")
+
+        OUTPUT_DIR = r"C:\clones\rlib_gfootball\cold_start\xgboost_tuned"
         
+        output_path = Path(OUTPUT_DIR)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        db_path = output_path / "optuna_study.db"
+        storage_name = f"sqlite:///{db_path.resolve()}"
+        logger.info(f"Optuna-Studie wird in Datenbank gespeichert: {storage_name}")
         study = optuna.create_study(
             direction='maximize',
             sampler=TPESampler(seed=42),
-            pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=3),
+            storage=storage_name,
+            load_if_exists=True
         )
         
         study.optimize(
-            lambda trial: self.objective(trial, X, y),
+            lambda trial: self.objective(trial, X, y, groups),
             n_trials=n_trials,
             show_progress_bar=True
         )
@@ -187,14 +194,13 @@ class XGBoostMemorizationTuner:
             pickle.dump(study, f)
         logger.info(f"\n✓ Study saved to: {study_path}")
         
-        return study.best_params
+        return study.best_params, study.best_trial
     
-    def train_final_model(self, X, y, params):
+    def train_final_model(self, X, y, params, best_trial):
         logger.info("\n" + "="*70)
         logger.info("Training Final Model on FULL Dataset")
         logger.info("="*70)
-        logger.info("Goal: Maximum memorization of training data")
-
+        
         final_params = params.copy()
         final_params.update({
             'tree_method': 'hist',
@@ -204,68 +210,39 @@ class XGBoostMemorizationTuner:
             'eval_metric': 'mlogloss',
             'random_state': 42,
             'verbosity': 1,
-            'n_jobs': -1,
+            'n_jobs': 0,
         })
         
-        if final_params['n_estimators'] < 1500:
-            final_params['n_estimators'] = 1500
-            logger.info(f"⚠️ Increased n_estimators to {final_params['n_estimators']} for better memorization")
+        if best_trial.user_attrs.get('early_stopped', False):
+            avg_iter = best_trial.user_attrs.get('avg_best_iteration', 1000)
+            final_params['n_estimators'] = int(avg_iter * 1.1)
+            logger.info(f"Using n_estimators={final_params['n_estimators']} (110% of CV best)")
         
         logger.info("\nFinal parameters:")
         for key, value in final_params.items():
             if key not in ['tree_method', 'device', 'num_class', 'objective', 
                           'eval_metric', 'random_state', 'verbosity', 'n_jobs']:
                 logger.info(f"  {key}: {value}")
-
-        model = xgb.XGBClassifier(**final_params, early_stopping_rounds=50)
         
-        n_val = min(10000, int(len(X) * 0.05))
-        indices = np.random.permutation(len(X))
-        val_indices = indices[:n_val]
-        
-        X_monitor = X[val_indices]
-        y_monitor = y[val_indices]
+        model = xgb.XGBClassifier(**final_params)
         
         logger.info(f"\nTraining with {len(X):,} samples...")
-        logger.info(f"Using {n_val:,} samples for monitoring convergence")
         
         start_time = time.time()
-
-        model.fit(
-            X, y,
-            eval_set=[(X_monitor, y_monitor)],
-        )
-        
+        model.fit(X, y, verbose=True)
         train_time = time.time() - start_time
-        
-        if hasattr(model, 'best_iteration') and model.best_iteration is not None:
-            logger.info(f"✓ Early stopped at iteration {model.best_iteration}/{final_params['n_estimators']}")
-        else:
-            logger.info(f"✓ Used all {final_params['n_estimators']} iterations")
         
         train_accuracy = model.score(X, y)
         
         logger.info(f"\n✓ Training complete in {train_time/60:.1f} minutes")
         logger.info(f"✓ Training accuracy: {train_accuracy:.6f} ({train_accuracy*100:.2f}%)")
         
-        if train_accuracy < 0.99:
-            logger.warning(f"⚠️ Accuracy below 99% - consider:")
-            logger.warning(f"   - Increasing n_estimators (current: {final_params['n_estimators']})")
-            logger.warning(f"   - Increasing max_depth (current: {final_params['max_depth']})")
-            logger.warning(f"   - Reducing regularization parameters")
-        else:
-            logger.info("✅ Excellent memorization achieved!")
-        
         return model, train_accuracy, train_time
     
     def save_model(self, model, params, accuracy, train_time):
-        base_name = f"xgboost_memorized_{self.stack_frames}x_acc{accuracy:.4f}"
+        base_name = f"xgboost_coldstart_{self.stack_frames}x_acc{accuracy:.4f}"
         
         model_path = self.output_dir / f"{base_name}.pkl"
-        
-        best_iteration = None
-        if hasattr(model, 'best_iteration'):
-            best_iteration = model.best_iteration
         
         with open(model_path, 'wb') as f:
             pickle.dump({
@@ -275,15 +252,11 @@ class XGBoostMemorizationTuner:
                 'train_time': train_time,
                 'stack_frames': self.stack_frames,
                 'ducklake_path': str(self.ducklake_path),
-                'best_iteration': best_iteration,
                 'n_estimators_trained': model.n_estimators
             }, f)
         
         logger.info(f"\n✓ Model saved to: {model_path}")
         logger.info(f"  Size: {model_path.stat().st_size / 1e6:.2f} MB")
-        
-        if best_iteration:
-            logger.info(f"  Best iteration: {best_iteration}")
         
         xgb_path = self.output_dir / f"{base_name}.json"
         model.save_model(str(xgb_path))
@@ -292,11 +265,11 @@ class XGBoostMemorizationTuner:
         return model_path
     
     def run_full_pipeline(self, n_trials=100):
-        X, y = self.load_full_dataset()
+        X, y, groups = self.load_full_dataset()
         
-        best_params = self.tune_hyperparameters(X, y, n_trials)
+        best_params, best_trial = self.tune_hyperparameters(X, y, groups, n_trials)
         
-        model, accuracy, train_time = self.train_final_model(X, y, best_params)
+        model, accuracy, train_time = self.train_final_model(X, y, best_params, best_trial)
         
         model_path = self.save_model(model, best_params, accuracy, train_time)
         
@@ -306,13 +279,12 @@ class XGBoostMemorizationTuner:
         logger.info(f"Final accuracy: {accuracy*100:.2f}%")
         logger.info(f"Training time: {train_time/60:.1f} minutes")
         logger.info(f"Model saved: {model_path}")
-        logger.info(f"\nNext step: Run 03_save_predictions.py to save predictions")
         
         return model_path, accuracy
 
 def main():
-    DUCKLAKE_PATH = r"/home/john/rlib_gfootball/cold_start/ducklake/replay_lake.duckdb"
-    OUTPUT_DIR = r"/home/john/rlib_gfootball/cold_start/nvidixgboost_tuned"
+    DUCKLAKE_PATH = r"C:\clones\rlib_gfootball\cold_start\ducklake\replay_lake.duckdb"
+    OUTPUT_DIR = r"C:\clones\rlib_gfootball\cold_start\xgboost_tuned"
     STACK_FRAMES = 4
     N_TRIALS = 50
     
@@ -321,10 +293,9 @@ def main():
     
     print(f"\n🎯 Final accuracy: {accuracy*100:.2f}%")
     print(f"📂 Model location: {model_path}")
-    print("\n💡 Tips for better memorization:")
-    print("   - Increase N_TRIALS for better hyperparameter search")
-    print("   - Check the saved study for convergence patterns")
-    print("   - If accuracy < 99%, consider deeper trees or more iterations")
+    print("\n💡 Model trained with replay-separated cross-validation")
+    print("   Ready for cold-start deployment to new games!")
+
 
 if __name__ == "__main__":
     main()
