@@ -1,3 +1,0 @@
---- Stage: stage_1_basic (ALL GENERATIONS) ---
-tensorboard --logdir "C:\clones\rlib_gfootball\training_results_NO_WEIGHTS\stage_1_basic" --reload_multifile true --purge_orphaned_data true --window_title "stage_1_basic - All Generations"
-
