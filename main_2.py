@@ -19,6 +19,8 @@ from ray.rllib.policy.policy import PolicySpec
 from ray.train import Checkpoint
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
+import pickle
+import xgboost as xgb
 
 import sys
 sys.path.append("C:/clones/rlib_gfootball/cold_start")
@@ -44,8 +46,47 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 2_000_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
+    # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
+    # TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 500_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
+    # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
+    # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
 ]
+
+class XGBoostTeacher:
+    """Lightweight wrapper for XGBoost teacher model"""
+    def __init__(self, model_path: str):
+        """Load the XGBoost model from disk"""
+        try:
+            with open(model_path, 'rb') as f:
+                self.model = pickle.load(f)
+            print(f"✅ XGBoost teacher loaded from {model_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to load XGBoost teacher from {model_path}: {e}")
+            self.model = None
+    
+    def predict_action(self, obs: np.ndarray) -> int:
+        """Predict action from observation"""
+        if self.model is None:
+            return np.random.randint(0, 19)  # Fallback to random
+        
+        try:
+            # Ensure obs is 2D for XGBoost
+            if obs.ndim == 1:
+                obs = obs.reshape(1, -1)
+            elif obs.ndim > 2:
+                # Flatten if stacked observations
+                obs = obs.reshape(1, -1)
+            
+            # Get prediction
+            pred = self.model.predict(obs)
+            return int(pred[0])
+        except Exception as e:
+            print(f"⚠️ Teacher prediction failed: {e}")
+            return np.random.randint(0, 19)
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
@@ -67,12 +108,38 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         if self.debug_mode:
             self.env_config.update({"render": True})
 
+        # XGBoost Teacher Configuration
+        self.use_xgb_teacher = self.env_config.get("use_xgb_teacher", False)
+        self.xgb_teacher = None
+        if self.use_xgb_teacher:
+            xgb_model_path = self.env_config.get("xgb_model_path", "xgboost_coldstart.pkl")
+            if os.path.exists(xgb_model_path):
+                self.xgb_teacher = XGBoostTeacher(xgb_model_path)
+            else:
+                print(f"⚠️ XGBoost model not found at {xgb_model_path}, teacher disabled")
+                self.use_xgb_teacher = False
+        
+        # Teacher decay configuration
+        self.teacher_mode = self.env_config.get("teacher_mode", "linear")  # linear, exp, adaptive
+        self.teacher_start_prob = self.env_config.get("teacher_start_prob", 1.0)
+        self.teacher_end_prob = self.env_config.get("teacher_end_prob", 0.0)
+        self.teacher_decay_steps = self.env_config.get("teacher_decay_steps", 5_000_000)
+        self.current_teacher_prob = self.teacher_start_prob
+        self.global_steps = 0
+        self.distill_logging = self.env_config.get("distill_logging", False)
+        
+        # Store last observations for teacher
+        self.last_obs = {}
+
         self.left_players = self.env_config["number_of_left_players_agent_controls"]
         self.right_players = self.env_config["number_of_right_players_agent_controls"]
 
         creation_kwargs = self.env_config.copy()
-        creation_kwargs.pop("debug_mode", None)
-        creation_kwargs.pop("_reset_render_state", None)
+        # Remove teacher-specific keys from env creation
+        for key in ["debug_mode", "_reset_render_state", "use_xgb_teacher", "xgb_model_path", 
+                    "teacher_mode", "teacher_start_prob", "teacher_end_prob", 
+                    "teacher_decay_steps", "distill_logging"]:
+            creation_kwargs.pop(key, None)
 
         try:
             self.env = football_env.create_environment(**creation_kwargs)
@@ -114,20 +181,80 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4, 115) if self.env_config.get("stacked", True) else (115,), dtype=np.float32)
             self.action_space = spaces.Discrete(19)
 
+    def _compute_teacher_prob(self) -> float:
+        """Compute current teacher probability based on decay mode"""
+        if not self.use_xgb_teacher:
+            return 0.0
+        
+        progress = min(1.0, self.global_steps / max(1, self.teacher_decay_steps))
+        
+        if self.teacher_mode == "linear":
+            # Linear decay from start_prob to end_prob
+            return self.teacher_start_prob + (self.teacher_end_prob - self.teacher_start_prob) * progress
+        
+        elif self.teacher_mode == "exp":
+            # Exponential decay
+            decay_rate = -np.log((self.teacher_end_prob + 1e-8) / self.teacher_start_prob)
+            return self.teacher_start_prob * np.exp(-decay_rate * progress)
+        
+        elif self.teacher_mode == "adaptive":
+            # For now, use linear decay (could be extended with performance-based adaptation)
+            return self.teacher_start_prob + (self.teacher_end_prob - self.teacher_start_prob) * progress
+        
+        else:
+            return self.teacher_start_prob
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         try:
             reset_result = self.env.reset()
             obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-            return self._split_obs(obs), {aid: {} for aid in self.agent_ids}
+            obs_dict = self._split_obs(obs)
+            
+            # Store observations for teacher
+            self.last_obs = obs_dict.copy()
+            
+            return obs_dict, {aid: {} for aid in self.agent_ids}
         except Exception as e:
              print(f"ERROR during reset: {e}")
              obs_dict = {aid: np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
                          for aid in self.agent_ids}
+             self.last_obs = obs_dict.copy()
              return obs_dict, {aid: {} for aid in self.agent_ids}
 
     def step(self, action_dict):
-        actions = [action_dict.get(aid, self.action_space.sample()) for aid in self.agent_ids]
+        # Update teacher probability
+        self.current_teacher_prob = self._compute_teacher_prob()
+        self.global_steps += 1
+        
+        # Potentially override actions with teacher actions
+        final_actions = {}
+        teacher_used = {}
+        
+        for aid in self.agent_ids:
+            student_action = action_dict.get(aid, self.action_space.sample())
+            
+            if self.use_xgb_teacher and self.xgb_teacher and aid in self.last_obs:
+                # Decide whether to use teacher
+                use_teacher = random.random() < self.current_teacher_prob
+                
+                if use_teacher:
+                    # Get teacher action
+                    teacher_action = self.xgb_teacher.predict_action(self.last_obs[aid])
+                    final_actions[aid] = teacher_action
+                    teacher_used[aid] = True
+                    
+                    if self.distill_logging and self.global_steps % 1000 == 0:
+                        print(f"Step {self.global_steps}: Teacher action for {aid}: {teacher_action} (prob={self.current_teacher_prob:.3f})")
+                else:
+                    final_actions[aid] = student_action
+                    teacher_used[aid] = False
+            else:
+                final_actions[aid] = student_action
+                teacher_used[aid] = False
+        
+        actions = [final_actions.get(aid, self.action_space.sample()) for aid in self.agent_ids]
+        
         try:
             step_result = self.env.step(actions)
         except Exception as e:
@@ -148,14 +275,25 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         else:
             raise ValueError(f"Unexpected step result format: {step_result}")
 
+        obs_dict = self._split_obs(obs)
+        # Store observations for next step
+        self.last_obs = obs_dict.copy()
+        
         dones = {aid: terminated for aid in self.agent_ids}; dones["__all__"] = terminated
         truncs = {aid: truncated for aid in self.agent_ids}; truncs["__all__"] = truncated
 
         if self.debug_mode:
             self.env.render()
 
-        agent_infos = {aid: info for aid in self.agent_ids}
-        return self._split_obs(obs), self._split_rewards(rewards), dones, truncs, agent_infos
+        # Add teacher usage info to infos if logging
+        agent_infos = {aid: info.copy() if isinstance(info, dict) else info for aid in self.agent_ids}
+        if self.distill_logging:
+            for aid in self.agent_ids:
+                if isinstance(agent_infos[aid], dict):
+                    agent_infos[aid]["teacher_used"] = teacher_used.get(aid, False)
+                    agent_infos[aid]["teacher_prob"] = self.current_teacher_prob
+        
+        return obs_dict, self._split_rewards(rewards), dones, truncs, agent_infos
 
     def _split_obs(self, obs):
         if not self.agent_ids: return {}
@@ -209,7 +347,10 @@ def create_impala_config(stage: TrainingStage,
                          active_zone: int = 15,
                          auto_prune: bool = True,
                          use_pretrained: bool = True,
-                         load_weights: bool = True  # <-- ÄNDERUNG 1: Akzeptiert die Variable
+                         load_weights: bool = True,
+                         use_xgb_teacher: bool = False,  # New parameter
+                         xgb_model_path: str = "xgboost_coldstart.pkl",  # New parameter
+                         teacher_config: dict = None  # New parameter
                          ) -> ImpalaConfig:
     config = ImpalaConfig()
 
@@ -222,6 +363,22 @@ def create_impala_config(stage: TrainingStage,
         "rewards": "scoring,checkpoints",
         "stacked": True,
     }
+    
+    # Add XGBoost teacher configuration if enabled
+    if use_xgb_teacher:
+        teacher_defaults = {
+            "use_xgb_teacher": True,
+            "xgb_model_path": xgb_model_path,
+            "teacher_mode": "linear",
+            "teacher_start_prob": 1.0,
+            "teacher_end_prob": 0.0,
+            "teacher_decay_steps": 5_000_000,
+            "distill_logging": False
+        }
+        if teacher_config:
+            teacher_defaults.update(teacher_config)
+        env_config.update(teacher_defaults)
+    
     config.environment("gfootball_multi", env_config=env_config)
     config.framework("torch")
 
@@ -254,7 +411,7 @@ def create_impala_config(stage: TrainingStage,
             "custom_model": "pretrained_model",
             "max_seq_len": 32,
             "custom_model_config": {
-                "load_weights": load_weights  # <-- ÄNDERUNG 2: Variable wird hier verwendet
+                "load_weights": load_weights
             }
         })
     else:
@@ -485,7 +642,10 @@ def train_stage_sequential_pbt(
     start_checkpoint: Optional[str],
     metric_path: str = "env_runners/episode_return_mean",
     use_pretrained: bool = True,
-    load_weights: bool = True  # <-- ÄNDERUNG 3: Akzeptiert die Variable
+    load_weights: bool = True,
+    use_xgb_teacher: bool = False,  # New parameter
+    xgb_model_path: str = "xgboost_coldstart.pkl",  # New parameter
+    teacher_config: dict = None  # New parameter
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     
     candidates_per_gen = tune_config.get("candidates_per_gen", 4)
@@ -509,7 +669,10 @@ def train_stage_sequential_pbt(
             policy_pool_dir=str(policy_pool_dir),
             max_versions=25, keep_top=10, active_zone=15, auto_prune=True,
             use_pretrained=use_pretrained,
-            load_weights=load_weights  # <-- Variable wird weitergereicht
+            load_weights=load_weights,
+            use_xgb_teacher=use_xgb_teacher,  # Pass new parameters
+            xgb_model_path=xgb_model_path,
+            teacher_config=teacher_config
         )
         base_cfg = base_cfg_obj.to_dict()
 
@@ -594,17 +757,28 @@ def train_stage_sequential_pbt(
     return best_ckpt, best_hp
 
 def main():
-    # --- HIER KONFIGURIEREN FÜR A/B-TEST ---
+    # --- Configuration for XGBoost Teacher Integration ---
     
-    # Lauf A: Mit Gewichten (Normalfall)
-    # USE_PRETRAINED = True
-    # LOAD_PRETRAINED_WEIGHTS = True 
-    # results_path_name = "training_results_WITH_WEIGHTS"
+    # Option A: With XGBoost Teacher
+    USE_XGB_TEACHER = True
+    XGB_MODEL_PATH = "xgboost_coldstart.pkl"  # Path to your trained XGBoost model
+    TEACHER_CONFIG = {
+        "teacher_mode": "linear",  # Options: "linear", "exp", "adaptive"
+        "teacher_start_prob": 0.8,  # Start with 80% teacher actions
+        "teacher_end_prob": 0.0,    # End with 0% teacher actions (pure RL)
+        "teacher_decay_steps": 5_000_000,  # Decay over 5M steps
+        "distill_logging": True     # Log teacher usage for analysis
+    }
     
-    # Lauf B: Ohne Gewichte (Zufällig)
-    USE_PRETRAINED = True           
-    LOAD_PRETRAINED_WEIGHTS = False     # <-- DAS IST DER SCHALTER!
-    results_path_name = "training_results_NO_WEIGHTS" # <-- WICHTIG: Anderer Ordner!
+    # Option B: Without XGBoost Teacher (original behavior)
+    # USE_XGB_TEACHER = False
+    # XGB_MODEL_PATH = ""
+    # TEACHER_CONFIG = {}
+    
+    # Existing configuration
+    USE_PRETRAINED = True         
+    LOAD_PRETRAINED_WEIGHTS = True
+    results_path_name = "training_results_WITH_XGB_TEACHER" if USE_XGB_TEACHER else "training_results_NO_TEACHER"
 
     # ----------------------------------------------
     
@@ -683,7 +857,10 @@ def main():
                 debug_mode=debug_mode,
                 start_checkpoint=current_checkpoint,
                 use_pretrained=USE_PRETRAINED,
-                load_weights=LOAD_PRETRAINED_WEIGHTS  # <-- ÄNDERUNG 4: Variable wird übergeben
+                load_weights=LOAD_PRETRAINED_WEIGHTS,
+                use_xgb_teacher=USE_XGB_TEACHER,  # Pass XGBoost teacher config
+                xgb_model_path=XGB_MODEL_PATH,
+                teacher_config=TEACHER_CONFIG
             )
             final_best_hparams = stage_hparams
 

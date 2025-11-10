@@ -55,7 +55,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         super().__init__()
         ray_temp = os.environ.get('RAY_TEMP_DIR', '/tmp')
         gf_logdir = os.path.join(ray_temp, 'gf')
-        
+         
         default_config = {
             "env_name": "11_vs_11_stochastic", "representation": "simple115v2",
             "rewards": "scoring,checkpoints", "number_of_left_players_agent_controls": 1,

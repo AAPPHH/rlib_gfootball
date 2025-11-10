@@ -149,10 +149,11 @@ def train_simple():
     config = load_best_config()
     
     # Hyperparameters
-    BATCH_SIZE = 512
+    BATCH_SIZE = 32_000
     LEARNING_RATE = 1e-3
-    EPOCHS = 50
-    NUM_SAMPLES = 100_000  # Erstmal mit weniger Samples testen
+    EPOCHS = 500
+    NUM_SAMPLES = 300_000  # Erstmal mit weniger Samples testen
+    EARLY_STOPPING_PATIENCE = 20  # <<< NEU: Anzahl Epochen ohne Verbesserung
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -207,6 +208,7 @@ def train_simple():
     alpha = 0.7
     
     best_val_acc = 0
+    epochs_no_improve = 0  # <<< NEU: Zähler für Early Stopping
     
     # Training Loop
     logger.info("Starte Training...")
@@ -305,12 +307,13 @@ def train_simple():
         avg_val_acc = val_acc / val_batches
         
         logger.info(f"Epoch {epoch+1}/{EPOCHS}")
-        logger.info(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}")
-        logger.info(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}")
+        logger.info(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc:.4f}")
+        logger.info(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}")
         
-        # Save best model
+        # Save best model & Check for Early Stopping
         if avg_val_acc > best_val_acc:
             best_val_acc = avg_val_acc
+            epochs_no_improve = 0  # <<< NEU: Zähler zurücksetzen
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -318,7 +321,15 @@ def train_simple():
                 'val_acc': best_val_acc,
                 'config': config
             }, OUTPUT_DIR / 'best_model.pth')
-            logger.info(f"  -> Neues bestes Modell gespeichert!")
+            logger.info(f"  -> Neues bestes Modell gespeichert!")
+        else:
+            epochs_no_improve += 1  # <<< NEU: Zähler erhöhen
+            logger.info(f"  -> Keine Verbesserung. Patience: {epochs_no_improve}/{EARLY_STOPPING_PATIENCE}")
+        
+        # <<< NEU: Abbruchbedingung prüfen
+        if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+            logger.info(f"\nEarly Stopping: Stoppe nach {epoch + 1} Epochen.")
+            break
         
         # Memory cleanup
         if torch.cuda.is_available():
