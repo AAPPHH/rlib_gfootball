@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=256
 #SBATCH --gres=gpu:8
 #SBATCH --mem=1500G
-#SBATCH --time=12:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=xgboost_%j.out
 #SBATCH --error=xgboost_%j.err
 #SBATCH --exclusive

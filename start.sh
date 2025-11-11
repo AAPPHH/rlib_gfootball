@@ -1,12 +1,11 @@
 #!/bin/bash
 
-#SBATCH --job-name=Gfootball_impala_gnn-mamba-KAN
+#SBATCH --job-name=Gfootball_impala_mamba
 #SBATCH --partition=compute
 #SBATCH --nodes=3
 #SBATCH --tasks-per-node=1
 #SBATCH --cpus-per-task=96
 #SBATCH --mem-per-cpu=9GB
-#SBATCH --gpus-per-node=8
 #SBATCH --time=90-00:00:00
 #SBATCH --output=/home/john/rlib_gfootball/ray_%j.out
 #SBATCH --error=/home/john/rlib_gfootball/ray_%j.err
@@ -17,7 +16,7 @@ set -x
 
 # Initialize conda
 source /home/john/miniforge/etc/profile.d/conda.sh
-conda activate base
+conda activate football_cuda
 
 # Remove ~/.local/bin from PATH and ensure conda env is first
 export PATH=$(echo $PATH | tr ':' '\n' | grep -v "^/home/john/.local/bin$" | tr '\n' ':' | sed 's/:$//')
@@ -102,28 +101,29 @@ for ((i = 1; i <= worker_num; i++)); do
 export PATH="/home/john/miniforge/envs/football_cuda/bin:\$PATH"
 export LD_LIBRARY_PATH="/home/john/miniforge/envs/football_cuda/lib:\$LD_LIBRARY_PATH"
 
-# Real storage auf gemounteten Speicher
-BASE_STORAGE=$BASE_STORAGE
-mkdir -p \$BASE_STORAGE/$node_i
+BASE_STORAGE="$BASE_STORAGE"
 
-# Kurzer Symlink
-SHORT_LINK=/tmp/r_${SLURM_JOB_ID}
-ln -sfn \$BASE_STORAGE/$node_i \$SHORT_LINK
+NODE_NAME=\$(hostname -s)
+mkdir -p "\$BASE_STORAGE/\$NODE_NAME"
 
-export RAY_TEMP_DIR=\$SHORT_LINK
+SHORT_LINK="/tmp/r_${SLURM_JOB_ID}"
+ln -sfn "\$BASE_STORAGE/\$NODE_NAME" "\$SHORT_LINK"
 
-echo "Worker $node_i: Storage=\$BASE_STORAGE/$node_i, Link=\$SHORT_LINK"
+export RAY_TEMP_DIR="\$SHORT_LINK"
 
-/home/john/miniforge/envs/football_cuda/bin/ray start --address='$ip_head' \
-    --node-ip-address='$node_ip' \
+echo "Worker \$NODE_NAME: Storage=\$BASE_STORAGE/\$NODE_NAME, Link=\$SHORT_LINK"
+
+ray start --address="$ip_head" \
+    --node-ip-address="$node_ip" \
     --num-cpus=${SLURM_CPUS_PER_TASK} \
     --num-gpus=${SLURM_GPUS_PER_TASK} \
-    --temp-dir='\$SHORT_LINK' \
+    --temp-dir="\$RAY_TEMP_DIR" \
     --block
 EOFWORKER
-    
+
     sleep 5
 done
+
 
 #==============================================================================
 # Starten einer zusätzlichen GPU Worker-Node
