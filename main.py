@@ -256,7 +256,7 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 1.0),
         grad_clip=0.5,
-        train_batch_size=64_000,
+        train_batch_size=8_000,
         learner_queue_size=32,
         num_sgd_iter=1,
         vtrace_clip_rho_threshold=1.0,
@@ -289,18 +289,17 @@ def create_impala_config(stage: TrainingStage,
         "custom_model": "GFootballMamba",
         "max_seq_len": 256,
         "custom_model_config": {
-
-            "d_model": 64,
-            "mamba_state": 8,
-            "num_mamba_layers": 8,
+            "d_model": 48,
+            "mamba_state": 6,
+            "num_mamba_layers": 6,
 
             "prev_action_emb": 8,
             "gradient_checkpointing": True,
 
-            "mlp_hidden_dims": [384, 192],
+            "mlp_hidden_dims": [256, 256],
             "mlp_activation": "silu",
-
-            "head_hidden_dims": [192],
+            
+            "head_hidden_dims": [128],
             "head_activation": "silu",
 
             "use_noisy": True,
@@ -431,7 +430,7 @@ def train_impala_with_restore(config):
     restore_path = config.pop("_restore_from", None)
     stop_timesteps = config.pop("_stop_timesteps", None)
     stop_after = config.pop("_stop_after", None)
-    checkpoint_freq = 50
+    checkpoint_freq = 5
 
     algo = Impala(config=config)
 
@@ -480,28 +479,28 @@ def train_impala_with_restore(config):
     result = {}
 
     while timesteps < target_timesteps:
-        result = algo.train()
-        timesteps = result.get("timesteps_total", timesteps)
-        iteration += 1
+            result = algo.train()
+            timesteps = result.get("timesteps_total", timesteps)
+            iteration += 1
 
-        if iteration % checkpoint_freq == 0:
-            save_result = algo.save()
-            chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-            if chk_path:
-                last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-                print(f"   Saved checkpoint at iter {iteration}: {chk_path}")
-                train.report(metrics=result, checkpoint=last_reported_checkpoint)
+            if iteration % checkpoint_freq == 0:
+                save_result = algo.save()
+                chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
+                if chk_path:
+                    last_reported_checkpoint = Checkpoint.from_directory(chk_path)
+                    print(f"   Saved checkpoint at iter {iteration}: {chk_path}")
+                    train.report(metrics=result, checkpoint=last_reported_checkpoint)
+                else:
+                    print(f"   WARN: algo.save() did not return a valid path at iteration {iteration}.")
+                    train.report(metrics=result, checkpoint=last_reported_checkpoint)
             else:
-                 print(f"   WARN: algo.save() did not return a valid path at iteration {iteration}.")
-                 train.report(metrics=result)
-        else:
-            train.report(metrics=result)
+                train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
-        if result.get("should_checkpoint", False) and not (iteration % checkpoint_freq == 0):
-             pass
-        if result.get("done", False):
-            print(f"   [Trainer Fn] Received 'done' signal from Tune at iteration {iteration}. Stopping.")
-            break
+            if result.get("should_checkpoint", False) and not (iteration % checkpoint_freq == 0):
+                pass
+            if result.get("done", False):
+                print(f"   [Trainer Fn] Received 'done' signal from Tune at iteration {iteration}. Stopping.")
+                break
 
     print(f"✅ [Trainer Fn] Loop finished. Saving final state ({start_timesteps} -> {timesteps} timesteps).")
     final_save_result = algo.save()
@@ -761,7 +760,7 @@ def train_single_stage(stage: TrainingStage,
         return None
 
 def main():
-    scheduler_mode = "pbt_sequential"
+    scheduler_mode = "pbt_parallel"
     
     tune_config = None
     if scheduler_mode == "pbt_sequential":
@@ -791,8 +790,7 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint =None
-
+    initial_checkpoint =r"C:\clones\rlib_gfootball\training_results_transfer\stage_2_basic\gen_21\run\train_impala_with_restore_c656c_lr=na_ent=na_vf=na\checkpoint_000001"
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())

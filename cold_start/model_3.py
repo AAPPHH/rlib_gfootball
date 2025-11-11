@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -122,39 +121,6 @@ class GFootballMamba(TorchRNN, nn.Module):
                  model_config: ModelConfigDict, name: str):
         nn.Module.__init__(self)
         cfg = model_config.get("custom_model_config", {})
-
-        weights_path = cfg.get("pretrained_weights_path")
-
-        # 3. LADEN Sie die Gewichte (falls der Pfad existiert)
-        if weights_path and os.path.exists(weights_path):
-            print(f"\n--- [GFootballMamba] Lade vortrainierte Gewichte von: {weights_path} ---")
-            try:
-                # Laden Sie die state_dict
-                # map_location='cpu' ist sicher, falls die Gewichte auf einer GPU gespeichert wurden
-                state_dict = torch.load(weights_path, map_location=torch.device("cpu"))
-                
-                # LADEN mit strict=False.
-                # Dies ist der "einfachste" Weg. Es lädt alle Layer, deren
-                # Namen und Formen übereinstimmen, und ignoriert den Rest.
-                # Das ist nützlich, wenn Ihr .pth nur den "Backbone" enthält,
-                # aber nicht die Policy/Value-Köpfe von RLlib.
-                missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
-                
-                print(f"[GFootballMamba] Gewichte geladen.")
-                if missing_keys:
-                    print(f"  > Fehlende Schlüssel (im Modell, nicht in .pth): {missing_keys}")
-                if unexpected_keys:
-                    print(f"  > Unerwartete Schlüssel (in .pth, nicht im Modell): {unexpected_keys}")
-                print("-------------------------------------------------------------------\n")
-                
-            except Exception as e:
-                print(f"\n--- [GFootballMamba] WARNUNG: Fehler beim Laden der Gewichte von {weights_path}: {e} ---")
-        
-        elif weights_path:
-            print(f"\n--- [GFootballMamba] WARNUNG: Pfad für Gewichte angegeben, aber nicht gefunden: {weights_path} ---")
-        
-        else:
-            print("\n--- [GFootballMamba] Keine vortrainierten Gewichte angegeben, starte Training von Grund auf. ---")
 
         self.d_model = cfg.get("d_model", 128)
         self.mamba_state = cfg.get("mamba_state", 8)
