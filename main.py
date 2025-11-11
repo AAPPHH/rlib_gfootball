@@ -21,12 +21,12 @@ from ray.train import Checkpoint
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
 
-from model import GFootballMamba
+from model_3 import GFootballMamba
 from model_2 import GFootballGNN
 
 from policy_pool import EnhancedSelfPlayCallback
 
-import os
+import os 
 
 @dataclass
 class TrainingStage:
@@ -41,10 +41,10 @@ class TrainingStage:
 
 TRAINING_STAGES = [
     # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
-    # TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
     # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
     # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 500_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
+    # TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 500_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
     # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
     # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
     # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
@@ -244,7 +244,7 @@ def create_impala_config(stage: TrainingStage,
         num_envs_per_env_runner=1,
         num_gpus_per_env_runner=0, 
         num_cpus_per_env_runner=tune_config["cpus_per_runner"],
-        rollout_fragment_length=128 if not debug_mode else 8,
+        rollout_fragment_length=512 if not debug_mode else 8,
         batch_mode="truncate_episodes"
     )
 
@@ -256,14 +256,14 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 1.0),
         grad_clip=0.5,
-        train_batch_size=128_000,
+        train_batch_size=64_000,
         learner_queue_size=32,
         num_sgd_iter=1,
         vtrace_clip_rho_threshold=1.0,
         vtrace_clip_pg_rho_threshold=1.0
     )
 
-    use_custom_model = False
+    use_custom_model = True
     
     # custom_model_config = {
     #     "custom_model": "GFootballGNN",
@@ -287,29 +287,29 @@ def create_impala_config(stage: TrainingStage,
     
     custom_model_config = {
         "custom_model": "GFootballMamba",
-        "max_seq_len": 32,
+        "max_seq_len": 256,
         "custom_model_config": {
-                "d_model": 48,
-                "mamba_state": 6,
-                "num_mamba_layers": 2,
-                "gnn_type": "sage",
-                "gnn_layers": 2,
-                "gnn_hidden": 24,
-                "gnn_output": 48,
-                "gnn_k_neighbors": 4,
-                "include_ball_node": True,
-                "include_global_node": True,
-                "include_team_nodes": True,
-                "include_possession_node": False,
-                "include_action_node": False,
-                "gnn_dropout": 0.05,
-                "kan_grid": 3,
-                "kan_hidden_dim": 32,
-                "kan_dropout": 0.0,
-                "prev_action_emb": 8,
-                "gradient_checkpointing": True,
-            },
-        }
+
+            "d_model": 64,
+            "mamba_state": 8,
+            "num_mamba_layers": 8,
+
+            "prev_action_emb": 8,
+            "gradient_checkpointing": True,
+
+            "mlp_hidden_dims": [384, 192],
+            "mlp_activation": "silu",
+
+            "head_hidden_dims": [192],
+            "head_activation": "silu",
+
+            "use_noisy": True,
+            "use_distributional": True,
+            "v_min": -10.0,
+            "v_max": 10.0,
+            "num_atoms": 51,
+        },
+    }
 
     standard_model_config = {
         "fcnet_hiddens": [512, 512], 
@@ -769,10 +769,10 @@ def main():
             "num_trials": 1,
             "max_concurrent": 1,
             "gpu_per_trial": 1,
-            "num_env_runners": 540,
+            "num_env_runners": 22,
             "cpus_per_runner": 1,
-            "candidates_per_gen": 3,
-            "steps_per_gen": 10_000_000,
+            "candidates_per_gen": 2,
+            "steps_per_gen": 1_000_000,
         }
 
     elif scheduler_mode == "pbt_parallel":
@@ -793,7 +793,7 @@ def main():
     debug_mode = False
     initial_checkpoint =None
 
-    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="auto")
+    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())
 

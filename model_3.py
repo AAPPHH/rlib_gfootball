@@ -315,10 +315,7 @@ class GFootballMamba(TorchRNN, nn.Module):
 
             logits = policy_logits_raw.float() 
             
-            if self.use_distributional:
-                self._value_out = value_raw.float()
-            else:
-                self._value_out = value_raw.float().squeeze(-1)
+            self._value_out = value_raw.float()
                 
         if "action_mask" in input_dict:
             action_mask = input_dict["action_mask"].float()
@@ -341,6 +338,14 @@ class GFootballMamba(TorchRNN, nn.Module):
 
     @override(TorchModelV2)
     def value_function(self) -> TensorType:
-        """Gibt den Critic-Output zurück (Verteilungs-Logits oder Skalar)."""
-        assert self._value_out is not None
-        return self._value_out
+        assert self._value_out is not None, "self._value_out is not set"
+
+        if self.use_distributional:
+            probs = F.softmax(self._value_out, dim=-1)
+            atoms = self.atoms.to(probs.device)
+            
+            expected_value = (probs * atoms).sum(dim=-1)
+            
+            return expected_value
+        else:
+            return self._value_out.squeeze(-1)
