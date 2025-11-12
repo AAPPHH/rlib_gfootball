@@ -23,3 +23,6 @@
 *.json
 *.log
 *.db
+*.parquet
+*.pyc
+*.pth

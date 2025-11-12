@@ -812,7 +812,7 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint = None
+    initial_checkpoint = r"C:\clones\rlib_gfootball\training_results_transfer_1\stage_2_basic_pbt_parallel_20251111_161306\train_impala_with_restore_eccd9_lr=2.0e-04_ent=0.007_vf=0.43\checkpoint_000503"
 
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
 

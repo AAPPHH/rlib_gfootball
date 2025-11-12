@@ -253,37 +253,18 @@ def create_impala_config(stage: TrainingStage,
 
     config.training(
         lr=hyperparams.get("lr", 5e-5),
+        gamma=hyperparams.get("gamma", 0.997),
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 1.0),
         grad_clip=0.5,
         train_batch_size=8_000,
-        learner_queue_size=32,
+        learner_queue_size=16,
         num_sgd_iter=1,
-        vtrace_clip_rho_threshold=1.0,
-        vtrace_clip_pg_rho_threshold=1.0
+        vtrace_clip_rho_threshold=hyperparams.get("vtrace_clip_rho_threshold", 1.0),
+        vtrace_clip_pg_rho_threshold=hyperparams.get("vtrace_clip_pg_rho_threshold", 1.0),
     )
 
     use_custom_model = True
-    
-    # custom_model_config = {
-    #     "custom_model": "GFootballGNN",
-    #     "max_seq_len": 32,
-    #     "custom_model_config": {
-    #         "d_model": 48,
-    #         "gnn_hidden": 24,
-    #         "gnn_k": 4,
-    #         "prev_action_emb": 8, 
-    #         "gradient_checkpointing": True,
-    #         "dropout": 0.05,
-    #         "tcn_kernel": 3,
-    #         "gru_hidden": 192,
-    #         "gru_bottleneck": 64,
-    #         "tcn_dilations": [1, 2],
-    #         "use_gnn": True,
-    #         "gnn_last_only": True,
-    #         "use_kan": True
-    #     }
-    # }
     
     custom_model_config = {
         "custom_model": "GFootballMamba",
@@ -296,7 +277,7 @@ def create_impala_config(stage: TrainingStage,
             "prev_action_emb": 8,
             "gradient_checkpointing": True,
 
-            "mlp_hidden_dims": [256, 256],
+            "mlp_hidden_dims": [256, 128],
             "mlp_activation": "silu",
             
             "head_hidden_dims": [128],
@@ -307,6 +288,8 @@ def create_impala_config(stage: TrainingStage,
             "v_min": -10.0,
             "v_max": 10.0,
             "num_atoms": 51,
+
+            "pretrained_weights_path": r"C:\clones\rlib_gfootball\cold_start\mamba_distillation_training\checkpoint_epoch_10.pth",
         },
     }
 
@@ -647,10 +630,13 @@ def train_single_stage(stage: TrainingStage,
     metric_path = "env_runners/episode_return_mean"
 
     hyperparams = {
-        "lr": tune.loguniform(3e-5, 3e-4),
-        "entropy_coeff": tune.uniform(0.002, 0.01),
-        "vf_loss_coeff": tune.uniform(0.3, 0.7),
-    }
+    "lr": tune.loguniform(2e-5, 1e-4),
+    "entropy_coeff": tune.uniform(0.006, 0.012),
+    "vf_loss_coeff": tune.uniform(0.5, 1.0),
+    "gamma": tune.uniform(0.996, 0.9985),
+    "vtrace_clip_rho_threshold": tune.uniform(0.95, 1.25),
+    "vtrace_clip_pg_rho_threshold": tune.uniform(0.9, 1.1),
+}
 
     param_space = create_impala_config(
         stage=stage,
@@ -702,6 +688,9 @@ def train_single_stage(stage: TrainingStage,
                 "lr": lambda: random.uniform(1e-5, 1e-3),
                 "entropy_coeff": lambda: random.uniform(0.0, 0.02),
                 "vf_loss_coeff": lambda: random.uniform(0.1, 1.0),
+                "gamma": lambda: random.uniform(0.996, 0.9985),
+                "vtrace_clip_rho_threshold": lambda: random.uniform(0.95, 1.25),
+                "vtrace_clip_pg_rho_threshold": lambda: random.uniform(0.9, 1.1),
             },
             quantile_fraction=0.25,
             resample_probability=0.25,
@@ -790,7 +779,7 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint =r"C:\clones\rlib_gfootball\training_results_transfer\stage_2_basic\gen_21\run\train_impala_with_restore_c656c_lr=na_ent=na_vf=na\checkpoint_000001"
+    initial_checkpoint = None
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
     print("Ray Cluster Resources:")
     print(ray.cluster_resources())

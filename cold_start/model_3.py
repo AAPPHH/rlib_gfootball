@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -116,11 +117,11 @@ class CompactS6Layer(nn.Module):
 
 
 class GFootballMamba(TorchRNN, nn.Module):
-    
     def __init__(self, obs_space: Space, action_space: Space, num_outputs: int,
                  model_config: ModelConfigDict, name: str):
         nn.Module.__init__(self)
         cfg = model_config.get("custom_model_config", {})
+        weights_path = cfg.get("pretrained_weights_path")
 
         self.d_model = cfg.get("d_model", 128)
         self.mamba_state = cfg.get("mamba_state", 8)
@@ -204,6 +205,31 @@ class GFootballMamba(TorchRNN, nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"[GFootballMamba] Total params: {total_params/1e6:.2f}M, "
               f"NoisyNets={self.use_noisy}, Distributional={self.use_distributional}")
+        
+        if weights_path and os.path.exists(weights_path):
+            print(f"\n--- [GFootballMamba] Lade vortrainierte Gewichte von: {weights_path} ---")
+            try:
+                state_dict = torch.load(weights_path, map_location=torch.device("cpu"))
+                
+                missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
+                
+                print(f"[GFootballMamba] Gewichte geladen.")
+                if missing_keys:
+                    print(f"  > Fehlende Schlüssel (im Modell, nicht in .pth): {missing_keys}")
+                if unexpected_keys:
+                    print(f"  > Unerwartete Schlüssel (in .pth, nicht im Modell): {unexpected_keys}")
+                print("-------------------------------------------------------------------\n")
+                
+            except Exception as e:
+                print(f"\n--- [GFootballMamba] WARNUNG: Fehler beim Laden der Gewichte von {weights_path}: {e} ---")
+                import traceback
+                traceback.print_exc()
+        
+        elif weights_path:
+            print(f"\n--- [GFootballMamba] WARNUNG: Pfad für Gewichte angegeben, aber nicht gefunden: {weights_path} ---")
+        
+        else:
+            print("\n--- [GFootballMamba] Keine vortrainierten Gewichte angegeben, starte Training von Grund auf. ---")
 
     def _get_activation(self, name: str) -> nn.Module:
         if name == 'silu': return nn.SiLU()
