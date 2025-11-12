@@ -410,43 +410,68 @@ def mutate_hparams(hp: dict) -> dict:
 
 
 def train_impala_with_restore(config):
+    """Fixed training function with proper checkpoint reporting for PBT"""
     restore_path = config.pop("_restore_from", None)
     stop_timesteps = config.pop("_stop_timesteps", None)
     stop_after = config.pop("_stop_after", None)
-    checkpoint_freq = 5
+    pbt_interval = config.pop("_pbt_interval", None)
+    
+    # Use checkpoint_freq=1 for maximum PBT compatibility
+    checkpoint_freq = 1
 
     algo = Impala(config=config)
 
     last_reported_checkpoint = None
     start_timesteps = 0
+    last_checkpoint_timesteps = 0
 
+    # Handle restoration or fresh start
     if restore_path:
         print(f"🔄 [Trainer Fn] Attempting to restore from: {restore_path}")
         try:
             algo.restore(restore_path)
             start_timesteps = algo._counters.get("num_env_steps_sampled", 0) if hasattr(algo, '_counters') else 0
             if algo.iteration > 0 and start_timesteps == 0:
-                 dummy_result = algo.train()
-                 start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
-                 print(f"   [Trainer Fn] Using result dict for start_timesteps: {start_timesteps}")
+                dummy_result = algo.train()
+                start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
+                print(f"   [Trainer Fn] Using result dict for start_timesteps: {start_timesteps}")
 
-            last_reported_checkpoint = Checkpoint.from_directory(restore_path)
+            # Only create checkpoint reference if path exists
+            if Path(restore_path).exists():
+                last_reported_checkpoint = Checkpoint.from_directory(restore_path)
             print(f"📊 [Trainer Fn] Successfully restored. Starting from timestep: {start_timesteps} (Iteration: {algo.iteration})")
         except Exception as e:
             print(f"⚠️ [Trainer Fn] ERROR restoring {restore_path}: {e}. Training from scratch.")
             save_result = algo.save()
             chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-            last_reported_checkpoint = Checkpoint.from_directory(chk_path)
+            if Path(chk_path).exists():
+                last_reported_checkpoint = Checkpoint.from_directory(chk_path)
             print(f"✅ [Trainer Fn] Initial checkpoint saved after failed restore: {chk_path}")
             start_timesteps = 0
     else:
         print("📝 [Trainer Fn] No restore path provided. Starting fresh and saving initial checkpoint...")
         save_result = algo.save()
         chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-        last_reported_checkpoint = Checkpoint.from_directory(chk_path)
+        if Path(chk_path).exists():
+            last_reported_checkpoint = Checkpoint.from_directory(chk_path)
         print(f"✅ [Trainer Fn] Initial checkpoint saved: {chk_path}")
         start_timesteps = 0
 
+    # CRITICAL FIX: Report initial checkpoint immediately so PBT can see it
+    if last_reported_checkpoint is not None:
+        train.report(
+            metrics={
+                "timesteps_total": start_timesteps,
+                "env_runners/episode_return_mean": 0.0,  # Initial value
+                "training_iteration": algo.iteration
+            },
+            checkpoint=last_reported_checkpoint
+        )
+        print(f"✅ [Trainer Fn] Reported initial checkpoint to Tune/PBT")
+    
+    last_checkpoint_timesteps = start_timesteps
+
+    # Determine stopping condition
     target_timesteps = float('inf')
     if stop_after is not None:
         target_timesteps = start_timesteps + int(stop_after)
@@ -461,45 +486,68 @@ def train_impala_with_restore(config):
     iteration = algo.iteration
     result = {}
 
+    # Main training loop
     while timesteps < target_timesteps:
+        try:
             result = algo.train()
             timesteps = result.get("timesteps_total", timesteps)
             iteration += 1
 
-            if iteration % checkpoint_freq == 0:
+            # Decide if we need to checkpoint
+            need_checkpoint = (iteration % checkpoint_freq == 0)
+            
+            # Also checkpoint if we've crossed a PBT interval boundary
+            if pbt_interval is not None and (timesteps - last_checkpoint_timesteps) >= pbt_interval:
+                need_checkpoint = True
+                print(f"   [Trainer Fn] PBT interval reached at timestep {timesteps}, forcing checkpoint")
+
+            if need_checkpoint:
                 save_result = algo.save()
                 chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-                if chk_path:
+                if chk_path and Path(chk_path).exists():
                     last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-                    print(f"   Saved checkpoint at iter {iteration}: {chk_path}")
-                    train.report(metrics=result, checkpoint=last_reported_checkpoint)
+                    last_checkpoint_timesteps = timesteps
+                    print(f"   Saved checkpoint at iter {iteration}, timestep {timesteps}: {chk_path}")
                 else:
-                    print(f"   WARN: algo.save() did not return a valid path at iteration {iteration}.")
-                    train.report(metrics=result, checkpoint=last_reported_checkpoint)
-            else:
-                train.report(metrics=result, checkpoint=last_reported_checkpoint)
+                    print(f"   WARN: Checkpoint path invalid or doesn't exist at iteration {iteration}.")
+            
+            # ALWAYS report with the last valid checkpoint
+            train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
-            if result.get("should_checkpoint", False) and not (iteration % checkpoint_freq == 0):
-                pass
             if result.get("done", False):
                 print(f"   [Trainer Fn] Received 'done' signal from Tune at iteration {iteration}. Stopping.")
                 break
+                
+        except Exception as e:
+            print(f"⚠️ [Trainer Fn] Error during training iteration {iteration}: {e}")
+            # Report even on error so PBT doesn't lose track of checkpoints
+            train.report(
+                metrics={
+                    "timesteps_total": timesteps,
+                    "training_iteration": iteration,
+                    "env_runners/episode_return_mean": result.get("env_runners/episode_return_mean", 0.0) if result else 0.0
+                },
+                checkpoint=last_reported_checkpoint
+            )
+            continue
 
+    # Save and report final checkpoint
     print(f"✅ [Trainer Fn] Loop finished. Saving final state ({start_timesteps} -> {timesteps} timesteps).")
     final_save_result = algo.save()
     final_chk_path = final_save_result.checkpoint.path if hasattr(final_save_result, 'checkpoint') else final_save_result
-    if final_chk_path:
+    if final_chk_path and Path(final_chk_path).exists():
         final_checkpoint = Checkpoint.from_directory(final_chk_path)
         print(f"✅ [Trainer Fn] Final checkpoint saved: {final_chk_path}")
-        final_metrics = result if result else algo.evaluate() if hasattr(algo, 'evaluate') else {}
+        final_metrics = result if result else {"timesteps_total": timesteps, "training_iteration": iteration}
         train.report(metrics=final_metrics, checkpoint=final_checkpoint)
     else:
         print("⚠️ [Trainer Fn] Failed to save final checkpoint.")
         if result:
-             train.report(metrics=result)
+            train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
     algo.stop()
     print(f"🛑 [Trainer Fn] Stopped algorithm.")
+
 
 def train_stage_sequential_pbt(
     stage: TrainingStage,
@@ -534,6 +582,7 @@ def train_stage_sequential_pbt(
 
         base_cfg["_restore_from"] = best_ckpt
         base_cfg["_stop_after"] = steps_per_gen
+        base_cfg["_pbt_interval"] = steps_per_gen  # Add PBT interval for sequential mode
 
         base_cfg["_hp_idx"] = tune.grid_search(list(range(len(candidates))))
         base_cfg["lr"]            = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["lr"])
@@ -618,6 +667,7 @@ def train_stage_sequential_pbt(
     print(f"   Final Best HParams   : {best_hp}")
     return best_ckpt, best_hp
 
+
 def train_single_stage(stage: TrainingStage,
                        stage_index: int,
                        tune_config: Dict[str, Any],
@@ -630,13 +680,13 @@ def train_single_stage(stage: TrainingStage,
     metric_path = "env_runners/episode_return_mean"
 
     hyperparams = {
-    "lr": tune.loguniform(2e-5, 1e-4),
-    "entropy_coeff": tune.uniform(0.006, 0.012),
-    "vf_loss_coeff": tune.uniform(0.5, 1.0),
-    "gamma": tune.uniform(0.996, 0.9985),
-    "vtrace_clip_rho_threshold": tune.uniform(0.95, 1.25),
-    "vtrace_clip_pg_rho_threshold": tune.uniform(0.9, 1.1),
-}
+        "lr": tune.loguniform(2e-5, 1e-4),
+        "entropy_coeff": tune.uniform(0.006, 0.012),
+        "vf_loss_coeff": tune.uniform(0.5, 1.0),
+        "gamma": tune.uniform(0.996, 0.9985),
+        "vtrace_clip_rho_threshold": tune.uniform(0.95, 1.25),
+        "vtrace_clip_pg_rho_threshold": tune.uniform(0.9, 1.1),
+    }
 
     param_space = create_impala_config(
         stage=stage,
@@ -650,6 +700,9 @@ def train_single_stage(stage: TrainingStage,
     param_space["_stop_timesteps"] = stage.max_timesteps
     if restore_checkpoint:
         param_space["_restore_from"] = restore_checkpoint
+    
+    # ADD THIS: Pass PBT interval to training function
+    param_space["_pbt_interval"] = tune_config.get("perturbation_interval", 1_000_000)
 
     num_runners = 0 if debug_mode else tune_config["num_env_runners"]
     gpus_for_learner = tune_config["gpu_per_trial"]
@@ -660,7 +713,6 @@ def train_single_stage(stage: TrainingStage,
     resources_per_trial = tune.PlacementGroupFactory(
         [
             {"CPU": cpus_for_driver, "GPU": 0}, 
-            
             {"CPU": cpus_for_learner, "GPU": gpus_for_learner},
         ] +
         [{"CPU": tune_config["cpus_per_runner"]}] * num_runners,
@@ -747,6 +799,7 @@ def train_single_stage(stage: TrainingStage,
         if best_result:
             print(f"   Best result existed but had no checkpoint (final score: {best_result.metrics.get(metric_path, 'N/A')}).")
         return None
+
 
 def main():
     scheduler_mode = "pbt_parallel"
@@ -859,6 +912,7 @@ def main():
     print("="*80 + "\n")
 
     ray.shutdown()
+
 
 if __name__ == "__main__":
     main()
