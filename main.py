@@ -20,10 +20,10 @@ from ray.rllib.policy.policy import PolicySpec
 from ray.train import Checkpoint
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
+from ray.tune import Trainable
 
 from model_3 import GFootballMamba
 from model_2 import GFootballGNN
-
 from policy_pool import EnhancedSelfPlayCallback
 
 import os 
@@ -239,7 +239,7 @@ def create_impala_config(stage: TrainingStage,
         vtrace_clip_pg_rho_threshold=hyperparams.get("vtrace_clip_pg_rho_threshold", 1.0),
     )
 
-    use_custom_model = True
+    use_custom_model = False
     
     custom_model_config = {
         "custom_model": "GFootballMamba",
@@ -269,7 +269,7 @@ def create_impala_config(stage: TrainingStage,
     }
 
     standard_model_config = {
-        "fcnet_hiddens": [512, 512], 
+        "fcnet_hiddens": [256, 128], 
         "fcnet_activation": "silu", 
         "use_lstm": True, 
         "lstm_cell_size": 512, 
@@ -384,114 +384,101 @@ def mutate_hparams(hp: dict) -> dict:
     return {"lr": lr, "entropy_coeff": ent, "vf_loss_coeff": vf}
 
 
-def train_impala_with_restore(config):
-    restore_path = config.pop("_restore_from", None)
-    stop_timesteps = config.pop("_stop_timesteps", None)
-    stop_after = config.pop("_stop_after", None)
-    pbt_interval = config.pop("_pbt_interval", None)
+# ====================================================================
+# NEW: ImpalaTrainable class that gives PBT control
+# ====================================================================
+class ImpalaTrainable(Trainable):
+    """
+    Diese Klasse kapselt die IMPALA-Logik und gibt PBT die Kontrolle.
+    PBT (der "Tuner") wird die 'step()'-Methode wiederholt aufrufen.
+    """
     
-    checkpoint_freq = 1
+    def setup(self, config):
+        """Wird einmal zu Beginn des Trials aufgerufen."""
+        
+        # Entferne die benutzerdefinierten Schlüssel aus der Konfiguration,
+        # bevor sie an Impala übergeben werden.
+        restore_path = config.pop("_restore_from", None)
+        self.stop_timesteps = config.pop("_stop_timesteps", None)
+        self.stop_after = config.pop("_stop_after", None)
+        self.pbt_interval = config.pop("_pbt_interval", None)
 
-    algo = Impala(config=config)
+        print(f"⚙️ [Trainable.setup] Initialisiere Impala...")
+        self.algo = Impala(config=config)
+        
+        # Track starting timesteps for curriculum learning
+        self.start_timesteps = 0
 
-    last_reported_checkpoint = None
-    start_timesteps = 0
-    last_checkpoint_timesteps = 0
+        # Dies ist für das "Curriculum-Lernen":
+        # Wiederherstellen vom Checkpoint der VORHERIGEN Stufe.
+        if restore_path:
+            print(f"🔄 [Trainable.setup] Stelle initialen Checkpoint wieder her: {restore_path}")
+            try:
+                self.algo.restore(restore_path)
+                # Get the current timesteps from the restored checkpoint
+                if hasattr(self.algo, '_counters'):
+                    self.start_timesteps = self.algo._counters.get("num_env_steps_sampled", 0)
+                elif self.algo.iteration > 0:
+                    # Try to get timesteps from a dummy train call
+                    dummy_result = self.algo.train()
+                    self.start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
+                print(f"✅ [Trainable.setup] Initiales Wiederherstellen erfolgreich. Start timesteps: {self.start_timesteps}")
+            except Exception as e:
+                print(f"⚠️ [Trainable.setup] FEHLER beim Wiederherstellen von {restore_path}: {e}. Starte von vorne.")
+                self.start_timesteps = 0
+        else:
+            print("📝 [Trainable.setup] Kein initialer Checkpoint. Starte frisch.")
 
-    if restore_path:
-        try:
-            algo.restore(restore_path)
-            start_timesteps = algo._counters.get("num_env_steps_sampled", 0) if hasattr(algo, '_counters') else 0
-            if algo.iteration > 0 and start_timesteps == 0:
-                dummy_result = algo.train()
-                start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
+    def step(self):
+        """
+        Wird von Tune/PBT wiederholt in einer Schleife aufgerufen.
+        Hier findet das eigentliche Training statt.
+        """
+        # Führe EINEN Trainingsschritt durch. Nicht Tausende.
+        # PBT ist jetzt die 'while'-Schleife.
+        result = self.algo.train()
+        
+        # Check if we need to stop based on our custom criteria
+        current_timesteps = result.get("timesteps_total", 0)
+        
+        # Handle stop_after (relative timesteps from start)
+        if self.stop_after is not None:
+            target_timesteps = self.start_timesteps + self.stop_after
+            if current_timesteps >= target_timesteps:
+                result["done"] = True
+                print(f"🛑 [Trainable.step] Reached stop_after limit: {current_timesteps} >= {target_timesteps}")
+        
+        # Handle stop_timesteps (absolute timesteps)
+        if self.stop_timesteps is not None:
+            if current_timesteps >= self.stop_timesteps:
+                result["done"] = True
+                print(f"🛑 [Trainable.step] Reached stop_timesteps limit: {current_timesteps} >= {self.stop_timesteps}")
+        
+        # Wir müssen nichts 'reporten', 'return result' reicht.
+        # Tune/PBT erhält dieses 'result' und prüft 'timesteps_total'.
+        return result
 
-            if Path(restore_path).exists():
-                last_reported_checkpoint = Checkpoint.from_directory(restore_path)
-        except Exception as e:
-            save_result = algo.save()
-            chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-            if Path(chk_path).exists():
-                last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-            start_timesteps = 0
-    else:
-        save_result = algo.save()
+    def save_checkpoint(self, checkpoint_dir):
+        """Wird von Tune aufgerufen, wenn ein Checkpoint gespeichert werden soll."""
+        save_result = self.algo.save(checkpoint_dir)
         chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-        if Path(chk_path).exists():
-            last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-        start_timesteps = 0
+        print(f"📤 [Trainable.save] Checkpoint gespeichert in: {chk_path}")
+        # WICHTIG: Gib den Verzeichnispfad zurück
+        return chk_path
 
-    if last_reported_checkpoint is not None:
-        train.report(
-            metrics={
-                "timesteps_total": start_timesteps,
-                "env_runners/episode_return_mean": 0.0, 
-                "training_iteration": algo.iteration
-            },
-            checkpoint=last_reported_checkpoint
-        )
-    
-    last_checkpoint_timesteps = start_timesteps
-
-    target_timesteps = float('inf')
-    if stop_after is not None:
-        target_timesteps = start_timesteps + int(stop_after)
-    elif stop_timesteps is not None:
-        target_timesteps = int(stop_timesteps)
-    else:
-        pass # Runs indefinitely if no stop condition
-
-    timesteps = start_timesteps
-    iteration = algo.iteration
-    result = {}
-
-    while timesteps < target_timesteps:
+    def load_checkpoint(self, checkpoint_path):
+        """Wird von PBT aufgerufen, um den Zustand eines besseren Trials zu laden."""
+        print(f"📥 [Trainable.load] Lade PBT-Checkpoint: {checkpoint_path}")
         try:
-            result = algo.train()
-            timesteps = result.get("timesteps_total", timesteps)
-            iteration += 1
-
-            need_checkpoint = (iteration % checkpoint_freq == 0)
-            
-            if pbt_interval is not None and (timesteps - last_checkpoint_timesteps) >= pbt_interval:
-                need_checkpoint = True
-
-            if need_checkpoint:
-                save_result = algo.save()
-                chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-                if chk_path and Path(chk_path).exists():
-                    last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-                    last_checkpoint_timesteps = timesteps
-                else:
-                    pass
-            
-            train.report(metrics=result, checkpoint=last_reported_checkpoint)
-
-            if result.get("done", False):
-                break
-                
+            self.algo.restore(checkpoint_path)
+            print(f"✅ [Trainable.load] PBT-Wiederherstellung erfolgreich.")
         except Exception as e:
-            train.report(
-                metrics={
-                    "timesteps_total": timesteps,
-                    "training_iteration": iteration,
-                    "env_runners/episode_return_mean": result.get("env_runners/episode_return_mean", 0.0) if result else 0.0
-                },
-                checkpoint=last_reported_checkpoint
-            )
-            continue
+            print(f"⚠️ [Trainable.load] FEHLER beim Laden des PBT-Checkpoints {checkpoint_path}: {e}")
 
-    final_save_result = algo.save()
-    final_chk_path = final_save_result.checkpoint.path if hasattr(final_save_result, 'checkpoint') else final_save_result
-    if final_chk_path and Path(final_chk_path).exists():
-        final_checkpoint = Checkpoint.from_directory(final_chk_path)
-        final_metrics = result if result else {"timesteps_total": timesteps, "training_iteration": iteration}
-        train.report(metrics=final_metrics, checkpoint=final_checkpoint)
-    else:
-        if result:
-            train.report(metrics=result, checkpoint=last_reported_checkpoint)
-
-    algo.stop()
+    def cleanup(self):
+        """Wird aufgerufen, wenn der Trial stoppt."""
+        self.algo.stop()
+        print("🛑 [Trainable.cleanup] Algorithmus gestoppt.")
 
 
 def train_stage_sequential_pbt(
@@ -501,6 +488,7 @@ def train_stage_sequential_pbt(
     start_checkpoint: Optional[str],
     metric_path: str = "env_runners/episode_return_mean",
 ) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Sequential PBT mode - runs multiple generations sequentially with mutation."""
     generations = tune_config.get("generations", 6)
     candidates_per_gen = tune_config.get("candidates_per_gen", 4)
     steps_per_gen = tune_config.get("steps_per_gen", 200_000)
@@ -512,7 +500,11 @@ def train_stage_sequential_pbt(
     best_ckpt = start_checkpoint
 
     gen = 0
-    while True:
+    while gen < generations:
+        print(f"\n{'='*60}")
+        print(f"Starting Generation {gen+1}/{generations} for stage: {stage.name}")
+        print(f"{'='*60}\n")
+        
         candidates = [deepcopy(best_hp)] + [mutate_hparams(best_hp) for _ in range(candidates_per_gen - 1)]
 
         base_cfg_obj = create_impala_config(
@@ -555,7 +547,7 @@ def train_stage_sequential_pbt(
         )
 
         tuner = tune.Tuner(
-            tune.with_resources(train_impala_with_restore, resources=resources_per_trial),
+            tune.with_resources(ImpalaTrainable, resources=resources_per_trial),  # CHANGED: Using ImpalaTrainable
             param_space=base_cfg,
             tune_config=tune.TuneConfig(
                 num_samples=1,
@@ -574,6 +566,7 @@ def train_stage_sequential_pbt(
         try:
             results = tuner.fit()
         except Exception as e:
+            print(f"⚠️ Error in generation {gen+1}: {e}")
             break
 
         if results.num_errors > 0:
@@ -593,11 +586,15 @@ def train_stage_sequential_pbt(
 
             best_hp = current_gen_best_hp
             best_ckpt = current_gen_best_ckpt
+            
+            print(f"✅ Generation {gen+1} complete. Best score: {current_gen_score:.3f}")
+            print(f"   Best hyperparams: {best_hp}")
 
         elif best_result:
-            pass # Keep previous best
+            print(f"⚠️ Generation {gen+1} had no checkpoint, keeping previous best")
         else:
-            break # Stop PBT
+            print(f"⚠️ Generation {gen+1} failed, stopping sequential PBT")
+            break
 
         gen += 1
 
@@ -610,7 +607,8 @@ def train_single_stage(stage: TrainingStage,
                        scheduler_mode: str,
                        debug_mode: bool,
                        restore_checkpoint: Optional[str]) -> Optional[str]:
-
+    """Train a single stage with either parallel PBT or no scheduler."""
+    
     results_path = Path(__file__).resolve().parent / "training_results_transfer"
     policy_pool_dir = results_path / f"{stage.name}_policy_pool"
     metric_path = "env_runners/episode_return_mean"
@@ -665,6 +663,7 @@ def train_single_stage(stage: TrainingStage,
 
     scheduler = None
     if scheduler_mode == "pbt_parallel":
+        print(f"🎯 Using Parallel PBT scheduler for stage: {stage.name}")
         scheduler = PopulationBasedTraining(
             time_attr="timesteps_total",
             metric=metric_path,
@@ -683,12 +682,11 @@ def train_single_stage(stage: TrainingStage,
             resample_probability=0.30,
             log_config=True,
         )
-
     else:
-        pass # No scheduler
+        print(f"📝 Running without scheduler for stage: {stage.name}")
 
     tuner = tune.Tuner(
-        tune.with_resources(train_impala_with_restore, resources=resources_per_trial),
+        tune.with_resources(ImpalaTrainable, resources=resources_per_trial),  # CHANGED: Using ImpalaTrainable
         param_space=param_space,
         tune_config=tune.TuneConfig(
             search_alg=search_alg,
@@ -708,6 +706,7 @@ def train_single_stage(stage: TrainingStage,
     try:
         results = tuner.fit()
     except Exception as e:
+        print(f"⚠️ Error during training: {e}")
         return None
 
     if results.experiment_path:
@@ -725,13 +724,16 @@ def train_single_stage(stage: TrainingStage,
 
     if best_result and best_result.checkpoint:
         checkpoint_path = str(best_result.checkpoint.path)
+        print(f"✅ Stage {stage.name} complete. Best checkpoint: {checkpoint_path}")
         return checkpoint_path
     else:
+        print(f"⚠️ Stage {stage.name} produced no checkpoint")
         return None
 
 
 def main():
-    scheduler_mode = "pbt_parallel"
+    """Main training loop with curriculum learning across stages."""
+    scheduler_mode = "pbt_parallel"  # Options: "pbt_sequential", "pbt_parallel"
     
     tune_config = None
     if scheduler_mode == "pbt_sequential":
@@ -743,16 +745,17 @@ def main():
             "cpus_per_runner": 1,
             "candidates_per_gen": 2,
             "steps_per_gen": 1_000_000,
+            "generations": 6,  # Number of sequential generations
         }
 
     elif scheduler_mode == "pbt_parallel":
         tune_config = {
-            "num_trials": 2,
+            "num_trials": 2,  # Population size for PBT
             "max_concurrent": 2,
             "gpu_per_trial": 0.5,
             "num_env_runners": 120,
             "cpus_per_runner": 1,
-            "perturbation_interval": 1_000_000,
+            "perturbation_interval": 1_000_000,  # PBT intervention frequency
         }
     else:
         raise ValueError(f"Unknown SCHEDULER_MODE: {scheduler_mode}")
@@ -761,7 +764,7 @@ def main():
     end_stage_index = len(TRAINING_STAGES) - 1
     
     debug_mode = False
-    initial_checkpoint = None
+    initial_checkpoint = r"/home/john/rlib_gfootball/training_results_transfer_2/stage_2_basic_pbt_parallel_20251113_110913/train_impala_with_restore_ce0df_lr=2.5e-05_ent=0.009_vf=0.92/checkpoint_001023"
     ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="auto")
 
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
@@ -772,11 +775,25 @@ def main():
     final_best_hparams = None
     results_path = Path(__file__).resolve().parent / "training_results_transfer"
 
+    print("\n" + "="*80)
+    print("PROGRESSIVE TRAINING / CURRICULUM LEARNING")
+    print(f"Scheduler Mode: {scheduler_mode}")
+    print(f"Stages to train: {start_stage_index} to {end_stage_index}")
+    print("="*80 + "\n")
+
     for i in range(start_stage_index, end_stage_index + 1):
         stage = TRAINING_STAGES[i]
+        print(f"\n{'='*60}")
+        print(f"Stage {i+1}/{len(TRAINING_STAGES)}: {stage.name}")
+        print(f"Description: {stage.description}")
+        print(f"Environment: {stage.env_name}")
+        print(f"Target reward: {stage.target_reward}, Max timesteps: {stage.max_timesteps:,}")
+        print(f"{'='*60}\n")
+        
         stage_checkpoint = None
         stage_hparams = {}
 
+        # Create stage directory and log tensorboard commands
         stage_root = results_path / stage.name
         stage_root.mkdir(parents=True, exist_ok=True)
         stage_tb_cmd = f'tensorboard --logdir "{stage_root}" --reload_multifile true --purge_orphaned_data true --window_title "{stage.name} - All Generations"'
@@ -791,6 +808,7 @@ def main():
             pass # Ignore write error
 
         if scheduler_mode == "pbt_sequential":
+            # Sequential PBT: multiple generations with mutation
             stage_checkpoint, stage_hparams = train_stage_sequential_pbt(
                 stage=stage,
                 tune_config=tune_config,
@@ -800,6 +818,7 @@ def main():
             final_best_hparams = stage_hparams
 
         elif scheduler_mode == "pbt_parallel":
+            # Parallel PBT: population-based training with real-time perturbation
             stage_checkpoint = train_single_stage(
                 stage=stage,
                 stage_index=i,
@@ -815,9 +834,11 @@ def main():
 
         if stage_checkpoint:
             current_checkpoint = stage_checkpoint
-            print(f"--- Stage {i + 1} finished successfully. Using checkpoint for next stage: {current_checkpoint} ---")
+            print(f"\n✅ Stage {i + 1} finished successfully.")
+            print(f"   Using checkpoint for next stage: {current_checkpoint}")
         else:
-            print(f"⚠️ Stage {i + 1} ({stage.name}) failed or produced no checkpoint. Stopping progressive training.")
+            print(f"\n⚠️ Stage {i + 1} ({stage.name}) failed or produced no checkpoint.")
+            print("   Stopping progressive training.")
             break
 
     print("\n" + "="*80)
