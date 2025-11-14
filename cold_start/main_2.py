@@ -15,9 +15,9 @@ import pyarrow.parquet as pq
 from gymnasium import spaces
 from tqdm import tqdm
 
-DUCKLAKE_PATH = r"C:\clones\rlib_gfootball\cold_start\ducklake\replay_lake.duckdb"
-XGBOOST_MODEL_PATH = r"C:\clones\rlib_gfootball\cold_start\xgboost_coldstart_acc0.6813_20251109_043825.pkl"
-OUTPUT_DIR = Path("C:/clones/rlib_gfootball/cold_start/mamba_distillation_training")
+DUCKLAKE_PATH = r"/home/john/rlib_gfootball/cold_start/ducklake/replay_lake.duckdb"
+XGBOOST_MODEL_PATH = r"/home/john/rlib_gfootball/cold_start/xgboost_optuna_output/xgboost_coldstart_acc0.6813_20251109_043825.pkl"
+OUTPUT_DIR = Path("/home/john/rlib_gfootball/cold_start/mamba_distillation_training")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 # Cache directory for preprocessed sequences (Parquet)

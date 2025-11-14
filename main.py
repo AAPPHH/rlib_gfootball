@@ -40,14 +40,7 @@ class TrainingStage:
     description: str = ""
 
 TRAINING_STAGES = [
-    # TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, "1 attacker, no opponents: finishes into an empty goal from close range."),
     TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
-    # TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000, "1 attacker facing a goalkeeper and nearby defender: focuses on control, positioning, and finishing."),
-    # TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000, "3 attackers versus 1 defender and a goalkeeper: encourages passing combinations and shot creation."),
-    # TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 500_000_000_000, "3 vs 0 on a full field against static opponents: focuses on offensive buildup and team coordination."),
-    # TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000, "Small-sided (3-player) team in 11v11 environment with easy opponents: transition toward full gameplay."),
-    # TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000, "3 vs 3 within a full 11v11 match (easy mode): focuses on spacing, positioning, and transitions."),
-    # TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000, "Full 11v11 stochastic match: standard difficulty with dynamic and realistic gameplay.")
 ]
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
@@ -55,7 +48,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         super().__init__()
         ray_temp = os.environ.get('RAY_TEMP_DIR', '/tmp')
         gf_logdir = os.path.join(ray_temp, 'gf')
-         
+        
         default_config = {
             "env_name": "11_vs_11_stochastic", "representation": "simple115v2",
             "rewards": "scoring,checkpoints", "number_of_left_players_agent_controls": 1,
@@ -68,7 +61,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         self.env_config = {**default_config, **config}
         self.debug_mode = self.env_config.get("debug_mode", False)
         if self.debug_mode:
-            print("--- Debug Mode Enabled: Rendering ON ---")
             self.env_config.update({"render": True})
 
         self.left_players = self.env_config["number_of_left_players_agent_controls"]
@@ -81,8 +73,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         try:
             self.env = football_env.create_environment(**creation_kwargs)
         except Exception as e:
-            print(f"Error creating GFootball environment: {e}")
-            print(f"Creation kwargs: {creation_kwargs}")
             raise
 
         self.agent_ids = [f"left_{i}" for i in range(self.left_players)] + \
@@ -96,13 +86,10 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
 
             if not self.agent_ids:
                 single_agent_obs_shape = _initial_obs_sample.shape
-                print(f"WARN: No controlled agents. Using raw env obs shape: {single_agent_obs_shape}")
             elif _initial_obs_sample.ndim > 0 and _initial_obs_sample.shape[0] == (self.left_players + self.right_players) and (self.left_players + self.right_players) > 0 :
                 single_agent_obs_shape = _initial_obs_sample.shape[1:]
-                print(f"Derived single agent obs shape: {single_agent_obs_shape} from multi-agent obs shape {_initial_obs_sample.shape}")
             else:
-                 single_agent_obs_shape = _initial_obs_sample.shape
-                 print(f"Assuming obs shape {single_agent_obs_shape} applies per agent.")
+                single_agent_obs_shape = _initial_obs_sample.shape
 
             self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=single_agent_obs_shape, dtype=_initial_obs_sample.dtype)
             if isinstance(self.env.action_space, spaces.Tuple):
@@ -112,16 +99,13 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             elif hasattr(self.env.action_space, 'nvec'):
                 self.action_space = spaces.Discrete(self.env.action_space.nvec[0])
             else:
-                print(f"WARNING: Unexpected base env action space type: {type(self.env.action_space)}. Assuming Discrete(19).")
                 self.action_space = spaces.Discrete(19)
 
             _temp_env.close()
 
         except Exception as e:
-            print(f"CRITICAL ERROR during environment space derivation: {e}")
             self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4, 115) if self.env_config.get("stacked", True) else (115,), dtype=np.float32)
             self.action_space = spaces.Discrete(19)
-            print(f"WARNING: Using potentially incorrect fallback spaces after error. Obs: {self.observation_space}, Act: {self.action_space}")
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -130,24 +114,22 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
             return self._split_obs(obs), {aid: {} for aid in self.agent_ids}
         except Exception as e:
-             print(f"ERROR during reset: {e}")
-             obs_dict = {aid: np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
-                         for aid in self.agent_ids}
-             return obs_dict, {aid: {} for aid in self.agent_ids}
+            obs_dict = {aid: np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
+                        for aid in self.agent_ids}
+            return obs_dict, {aid: {} for aid in self.agent_ids}
 
     def step(self, action_dict):
         actions = [action_dict.get(aid, self.action_space.sample()) for aid in self.agent_ids]
         try:
             step_result = self.env.step(actions)
         except Exception as e:
-             print(f"ERROR during step with actions {actions}: {e}")
-             obs_dict = {aid: np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
-                         for aid in self.agent_ids}
-             rewards_dict = {aid: 0.0 for aid in self.agent_ids}
-             dones = {aid: True for aid in self.agent_ids}; dones["__all__"] = True
-             truncs = {aid: False for aid in self.agent_ids}; truncs["__all__"] = False
-             infos = {aid: {"error": str(e)} for aid in self.agent_ids}
-             return obs_dict, rewards_dict, dones, truncs, infos
+            obs_dict = {aid: np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
+                        for aid in self.agent_ids}
+            rewards_dict = {aid: 0.0 for aid in self.agent_ids}
+            dones = {aid: True for aid in self.agent_ids}; dones["__all__"] = True
+            truncs = {aid: False for aid in self.agent_ids}; truncs["__all__"] = False
+            infos = {aid: {"error": str(e)} for aid in self.agent_ids}
+            return obs_dict, rewards_dict, dones, truncs, infos
 
         if len(step_result) == 5:
             obs, rewards, terminated, truncated, info = step_result
@@ -176,20 +158,15 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             if obs.shape[1:] == self.observation_space.shape:
                 return {self.agent_ids[i]: obs[i].astype(np.float32) for i in range(num_agents)}
             else:
-                 print(f"Warning: Obs shape per agent {obs.shape[1:]} doesn't match expected space {self.observation_space.shape}")
-                 return {self.agent_ids[i]: obs[i].astype(np.float32) for i in range(num_agents)}
+                return {self.agent_ids[i]: obs[i].astype(np.float32) for i in range(num_agents)}
         elif obs.shape == self.observation_space.shape and num_agents > 0:
-             print(f"Warning: Received single observation shape {obs.shape} but expected {num_agents} agents. Broadcasting.")
-             return {aid: obs.astype(np.float32) for aid in self.agent_ids}
+            return {aid: obs.astype(np.float32) for aid in self.agent_ids}
         elif obs.ndim == 1 and num_agents > 0 and self.observation_space.shape is not None and np.prod(self.observation_space.shape) > 0 and obs.size == num_agents * int(np.prod(self.observation_space.shape)):
-             print(f"Warning: Received flattened obs shape {obs.shape}. Attempting to reshape.")
-             try:
-                 obs_reshaped = obs.reshape(num_agents, *self.observation_space.shape)
-                 return {self.agent_ids[i]: obs_reshaped[i].astype(np.float32) for i in range(num_agents)}
-             except ValueError as e:
-                 print(f"ERROR: Could not reshape flattened obs ({obs.shape}) into ({num_agents}, {self.observation_space.shape}). Error: {e}")
-        else:
-            print(f"Warning: Unexpected obs structure for splitting. Shape: {obs.shape}, Num agents: {num_agents}, Expected single shape: {self.observation_space.shape}")
+            try:
+                obs_reshaped = obs.reshape(num_agents, *self.observation_space.shape)
+                return {self.agent_ids[i]: obs_reshaped[i].astype(np.float32) for i in range(num_agents)}
+            except ValueError as e:
+                pass
 
         zero_obs = np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
         return {aid: zero_obs.astype(np.float32) for aid in self.agent_ids}
@@ -198,13 +175,11 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         if np.isscalar(rewards):
             return {aid: float(rewards) for aid in self.agent_ids}
         if isinstance(rewards, (list, np.ndarray)):
-             if len(rewards) == len(self.agent_ids):
-                 return {self.agent_ids[i]: float(rewards[i]) for i in range(len(self.agent_ids))}
-             else:
-                 print(f"Warning: Reward list/array length {len(rewards)} != num_agents {len(self.agent_ids)}. Rewards: {rewards}")
-                 return {aid: 0.0 for aid in self.agent_ids}
+            if len(rewards) == len(self.agent_ids):
+                return {self.agent_ids[i]: float(rewards[i]) for i in range(len(self.agent_ids))}
+            else:
+                return {aid: 0.0 for aid in self.agent_ids}
 
-        print(f"Warning: Unexpected reward structure: {rewards} (Type: {type(rewards)}). Assigning 0.")
         return {aid: 0.0 for aid in self.agent_ids}
 
     def close(self):
@@ -257,7 +232,7 @@ def create_impala_config(stage: TrainingStage,
         entropy_coeff=hyperparams.get("entropy_coeff", 0.008),
         vf_loss_coeff=hyperparams.get("vf_loss_coeff", 1.0),
         grad_clip=0.5,
-        train_batch_size=8_000,
+        train_batch_size=128_000,
         learner_queue_size=16,
         num_sgd_iter=1,
         vtrace_clip_rho_threshold=hyperparams.get("vtrace_clip_rho_threshold", 1.0),
@@ -289,7 +264,7 @@ def create_impala_config(stage: TrainingStage,
             "v_max": 10.0,
             "num_atoms": 51,
 
-            "pretrained_weights_path": r"C:\clones\rlib_gfootball\cold_start\mamba_distillation_training\checkpoint_epoch_10.pth",
+            "pretrained_weights_path": r"/home/john/rlib_gfootball/cold_start/mamba_distillation_training/checkpoint_epoch_40.pth",
         },
     }
 
@@ -410,13 +385,11 @@ def mutate_hparams(hp: dict) -> dict:
 
 
 def train_impala_with_restore(config):
-    """Fixed training function with proper checkpoint reporting for PBT"""
     restore_path = config.pop("_restore_from", None)
     stop_timesteps = config.pop("_stop_timesteps", None)
     stop_after = config.pop("_stop_after", None)
     pbt_interval = config.pop("_pbt_interval", None)
     
-    # Use checkpoint_freq=1 for maximum PBT compatibility
     checkpoint_freq = 1
 
     algo = Impala(config=config)
@@ -425,81 +398,63 @@ def train_impala_with_restore(config):
     start_timesteps = 0
     last_checkpoint_timesteps = 0
 
-    # Handle restoration or fresh start
     if restore_path:
-        print(f"🔄 [Trainer Fn] Attempting to restore from: {restore_path}")
         try:
             algo.restore(restore_path)
             start_timesteps = algo._counters.get("num_env_steps_sampled", 0) if hasattr(algo, '_counters') else 0
             if algo.iteration > 0 and start_timesteps == 0:
                 dummy_result = algo.train()
                 start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
-                print(f"   [Trainer Fn] Using result dict for start_timesteps: {start_timesteps}")
 
-            # Only create checkpoint reference if path exists
             if Path(restore_path).exists():
                 last_reported_checkpoint = Checkpoint.from_directory(restore_path)
-            print(f"📊 [Trainer Fn] Successfully restored. Starting from timestep: {start_timesteps} (Iteration: {algo.iteration})")
         except Exception as e:
-            print(f"⚠️ [Trainer Fn] ERROR restoring {restore_path}: {e}. Training from scratch.")
             save_result = algo.save()
             chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
             if Path(chk_path).exists():
                 last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-            print(f"✅ [Trainer Fn] Initial checkpoint saved after failed restore: {chk_path}")
             start_timesteps = 0
     else:
-        print("📝 [Trainer Fn] No restore path provided. Starting fresh and saving initial checkpoint...")
         save_result = algo.save()
         chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
         if Path(chk_path).exists():
             last_reported_checkpoint = Checkpoint.from_directory(chk_path)
-        print(f"✅ [Trainer Fn] Initial checkpoint saved: {chk_path}")
         start_timesteps = 0
 
-    # CRITICAL FIX: Report initial checkpoint immediately so PBT can see it
     if last_reported_checkpoint is not None:
         train.report(
             metrics={
                 "timesteps_total": start_timesteps,
-                "env_runners/episode_return_mean": 0.0,  # Initial value
+                "env_runners/episode_return_mean": 0.0, 
                 "training_iteration": algo.iteration
             },
             checkpoint=last_reported_checkpoint
         )
-        print(f"✅ [Trainer Fn] Reported initial checkpoint to Tune/PBT")
     
     last_checkpoint_timesteps = start_timesteps
 
-    # Determine stopping condition
     target_timesteps = float('inf')
     if stop_after is not None:
         target_timesteps = start_timesteps + int(stop_after)
-        print(f"   [Trainer Fn] Incremental training: Target timesteps = {start_timesteps} + {stop_after} = {target_timesteps}")
     elif stop_timesteps is not None:
         target_timesteps = int(stop_timesteps)
-        print(f"   [Trainer Fn] Absolute training: Target timesteps = {target_timesteps}")
     else:
-        print("   [Trainer Fn] WARN: No stop condition (_stop_after or _stop_timesteps) provided. Running indefinitely?")
+        pass # Runs indefinitely if no stop condition
 
     timesteps = start_timesteps
     iteration = algo.iteration
     result = {}
 
-    # Main training loop
     while timesteps < target_timesteps:
         try:
             result = algo.train()
             timesteps = result.get("timesteps_total", timesteps)
             iteration += 1
 
-            # Decide if we need to checkpoint
             need_checkpoint = (iteration % checkpoint_freq == 0)
             
-            # Also checkpoint if we've crossed a PBT interval boundary
             if pbt_interval is not None and (timesteps - last_checkpoint_timesteps) >= pbt_interval:
                 need_checkpoint = True
-                print(f"   [Trainer Fn] PBT interval reached at timestep {timesteps}, forcing checkpoint")
 
             if need_checkpoint:
                 save_result = algo.save()
@@ -507,20 +462,15 @@ def train_impala_with_restore(config):
                 if chk_path and Path(chk_path).exists():
                     last_reported_checkpoint = Checkpoint.from_directory(chk_path)
                     last_checkpoint_timesteps = timesteps
-                    print(f"   Saved checkpoint at iter {iteration}, timestep {timesteps}: {chk_path}")
                 else:
-                    print(f"   WARN: Checkpoint path invalid or doesn't exist at iteration {iteration}.")
+                    pass
             
-            # ALWAYS report with the last valid checkpoint
             train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
             if result.get("done", False):
-                print(f"   [Trainer Fn] Received 'done' signal from Tune at iteration {iteration}. Stopping.")
                 break
                 
         except Exception as e:
-            print(f"⚠️ [Trainer Fn] Error during training iteration {iteration}: {e}")
-            # Report even on error so PBT doesn't lose track of checkpoints
             train.report(
                 metrics={
                     "timesteps_total": timesteps,
@@ -531,22 +481,17 @@ def train_impala_with_restore(config):
             )
             continue
 
-    # Save and report final checkpoint
-    print(f"✅ [Trainer Fn] Loop finished. Saving final state ({start_timesteps} -> {timesteps} timesteps).")
     final_save_result = algo.save()
     final_chk_path = final_save_result.checkpoint.path if hasattr(final_save_result, 'checkpoint') else final_save_result
     if final_chk_path and Path(final_chk_path).exists():
         final_checkpoint = Checkpoint.from_directory(final_chk_path)
-        print(f"✅ [Trainer Fn] Final checkpoint saved: {final_chk_path}")
         final_metrics = result if result else {"timesteps_total": timesteps, "training_iteration": iteration}
         train.report(metrics=final_metrics, checkpoint=final_checkpoint)
     else:
-        print("⚠️ [Trainer Fn] Failed to save final checkpoint.")
         if result:
             train.report(metrics=result, checkpoint=last_reported_checkpoint)
 
     algo.stop()
-    print(f"🛑 [Trainer Fn] Stopped algorithm.")
 
 
 def train_stage_sequential_pbt(
@@ -582,10 +527,10 @@ def train_stage_sequential_pbt(
 
         base_cfg["_restore_from"] = best_ckpt
         base_cfg["_stop_after"] = steps_per_gen
-        base_cfg["_pbt_interval"] = steps_per_gen  # Add PBT interval for sequential mode
+        base_cfg["_pbt_interval"] = steps_per_gen
 
         base_cfg["_hp_idx"] = tune.grid_search(list(range(len(candidates))))
-        base_cfg["lr"]            = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["lr"])
+        base_cfg["lr"]          = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["lr"])
         base_cfg["entropy_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["entropy_coeff"])
         base_cfg["vf_loss_coeff"] = tune.sample_from(lambda config: candidates[config["_hp_idx"]]["vf_loss_coeff"])
         
@@ -629,12 +574,9 @@ def train_stage_sequential_pbt(
         try:
             results = tuner.fit()
         except Exception as e:
-            print(f"ERROR during tuner.fit() for Gen {gen+1}: {e}")
-            print("Stopping PBT for this stage.")
             break
 
         if results.num_errors > 0:
-            print(f"⚠️ [SeqPBT] Generation {gen+1} finished with {results.num_errors} error(s).")
             best_result = results.get_best_result(metric=metric_path, mode="max", filter_nan_and_inf=True)
         else:
             best_result = results.get_best_result(metric=metric_path, mode="max")
@@ -649,22 +591,16 @@ def train_stage_sequential_pbt(
             current_gen_best_ckpt = str(best_result.checkpoint.path)
             current_gen_score = best_result.metrics.get(metric_path, -float('inf'))
 
-            print(f"[SeqPBT] Gen {gen+1} Winner: Score={current_gen_score:.4f}, HParams={current_gen_best_hp}, Checkpoint={current_gen_best_ckpt}")
-
             best_hp = current_gen_best_hp
             best_ckpt = current_gen_best_ckpt
 
         elif best_result:
-            print(f"⚠️ [SeqPBT] Gen {gen+1}: Best result found but no checkpoint. Keeping previous best ckpt: {best_ckpt}. HParams remain: {best_hp}")
+            pass # Keep previous best
         else:
-            print(f"⚠️ [SeqPBT] Gen {gen+1}: No valid results found. Keeping previous best ckpt: {best_ckpt}. Stopping PBT.")
-            break
+            break # Stop PBT
 
         gen += 1
 
-    print(f"\n[SeqPBT] Finished PBT for Stage '{stage.name}'.")
-    print(f"   Final Best Checkpoint: {best_ckpt}")
-    print(f"   Final Best HParams   : {best_hp}")
     return best_ckpt, best_hp
 
 
@@ -683,7 +619,7 @@ def train_single_stage(stage: TrainingStage,
         "lr": tune.loguniform(2e-5, 1e-4),
         "entropy_coeff": tune.uniform(0.006, 0.012),
         "vf_loss_coeff": tune.uniform(0.5, 1.0),
-        "gamma": tune.uniform(0.996, 0.9985),
+        "gamma": tune.uniform(0.997, 0.9995),
         "vtrace_clip_rho_threshold": tune.uniform(0.95, 1.25),
         "vtrace_clip_pg_rho_threshold": tune.uniform(0.9, 1.1),
     }
@@ -701,14 +637,13 @@ def train_single_stage(stage: TrainingStage,
     if restore_checkpoint:
         param_space["_restore_from"] = restore_checkpoint
     
-    # ADD THIS: Pass PBT interval to training function
     param_space["_pbt_interval"] = tune_config.get("perturbation_interval", 1_000_000)
 
     num_runners = 0 if debug_mode else tune_config["num_env_runners"]
     gpus_for_learner = tune_config["gpu_per_trial"]
     
-    cpus_for_learner = 1 
-    cpus_for_driver = 2 
+    cpus_for_learner = 5
+    cpus_for_driver = 2
 
     resources_per_trial = tune.PlacementGroupFactory(
         [
@@ -721,7 +656,7 @@ def train_single_stage(stage: TrainingStage,
 
     stop_criteria = {"timesteps_total": stage.max_timesteps}
     checkpoint_config = CheckpointConfig(
-        num_to_keep=3,
+        num_to_keep=None,
         checkpoint_score_attribute=metric_path,
         checkpoint_score_order="max",
     )
@@ -730,26 +665,27 @@ def train_single_stage(stage: TrainingStage,
 
     scheduler = None
     if scheduler_mode == "pbt_parallel":
-        print("   -> Configuring PopulationBasedTraining Scheduler")
         scheduler = PopulationBasedTraining(
             time_attr="timesteps_total",
             metric=metric_path,
             mode="max",
             perturbation_interval=tune_config["perturbation_interval"],
             hyperparam_mutations={
-                "lr": lambda: random.uniform(1e-5, 1e-3),
-                "entropy_coeff": lambda: random.uniform(0.0, 0.02),
-                "vf_loss_coeff": lambda: random.uniform(0.1, 1.0),
-                "gamma": lambda: random.uniform(0.996, 0.9985),
-                "vtrace_clip_rho_threshold": lambda: random.uniform(0.95, 1.25),
-                "vtrace_clip_pg_rho_threshold": lambda: random.uniform(0.9, 1.1),
+                "lr": tune.loguniform(4e-5, 1e-4),
+                "entropy_coeff": tune.uniform(0.006, 0.012),
+                "vf_loss_coeff": tune.uniform(0.5, 1.0),
+
+                "gamma": [0.997, 0.9975, 0.998, 0.9985, 0.999],
+                "vtrace_clip_rho_threshold": [0.9, 1.0, 1.1],
+                "vtrace_clip_pg_rho_threshold": [0.9, 1.0, 1.1],
             },
             quantile_fraction=0.25,
-            resample_probability=0.25,
+            resample_probability=0.30,
             log_config=True,
         )
+
     else:
-        print(f"   WARN: train_single_stage called with mode '{scheduler_mode}', expected 'pbt_parallel'. No scheduler used.")
+        pass # No scheduler
 
     tuner = tune.Tuner(
         tune.with_resources(train_impala_with_restore, resources=resources_per_trial),
@@ -772,7 +708,6 @@ def train_single_stage(stage: TrainingStage,
     try:
         results = tuner.fit()
     except Exception as e:
-        print(f"ERROR during tuner.fit() for Stage {stage_index+1}: {e}")
         return None
 
     if results.experiment_path:
@@ -784,20 +719,14 @@ def train_single_stage(stage: TrainingStage,
                 f.write(f"--- Stage: {stage.name} ({scheduler_mode}) ---\n")
                 f.write(f"{tensorboard_command}\n\n")
         except IOError as e:
-            print(f"Error writing to tensorboard_commands.txt: {e}")
+            pass # Ignore write error
 
     best_result = results.get_best_result(metric=metric_path, mode="max")
 
     if best_result and best_result.checkpoint:
         checkpoint_path = str(best_result.checkpoint.path)
-        best_score = best_result.metrics.get(metric_path, "N/A")
-        print(f"\nSTAGE {stage_index + 1} COMPLETE. Best Score={best_score:.4f}. Best Checkpoint: {checkpoint_path}")
         return checkpoint_path
     else:
-        num_errors = results.num_errors
-        print(f"\nWARN: No best checkpoint found for Stage {stage.name}. Num errors: {num_errors}.")
-        if best_result:
-            print(f"   Best result existed but had no checkpoint (final score: {best_result.metrics.get(metric_path, 'N/A')}).")
         return None
 
 
@@ -821,7 +750,7 @@ def main():
             "num_trials": 2,
             "max_concurrent": 2,
             "gpu_per_trial": 0.5,
-            "num_env_runners": 9,
+            "num_env_runners": 120,
             "cpus_per_runner": 1,
             "perturbation_interval": 1_000_000,
         }
@@ -833,9 +762,7 @@ def main():
     
     debug_mode = False
     initial_checkpoint = None
-    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="local")
-    print("Ray Cluster Resources:")
-    print(ray.cluster_resources())
+    ray.init(ignore_reinit_error=True, log_to_driver=False, local_mode=debug_mode, address="auto")
 
     register_env("gfootball_multi", lambda config: GFootballMultiAgentEnv(config))
     ModelCatalog.register_custom_model("GFootballGNN", GFootballGNN)
@@ -850,22 +777,18 @@ def main():
         stage_checkpoint = None
         stage_hparams = {}
 
-        print(f"\n--- Starting Stage {i + 1}/{end_stage_index + 1}: {stage.name} ---")
-
         stage_root = results_path / stage.name
         stage_root.mkdir(parents=True, exist_ok=True)
-
         stage_tb_cmd = f'tensorboard --logdir "{stage_root}" --reload_multifile true --purge_orphaned_data true --window_title "{stage.name} - All Generations"'
-
         log_file = results_path / "tensorboard_commands.txt"
         try:
             with open(log_file, "a", encoding="utf-8") as f:
                 if log_file.exists() and log_file.stat().st_size > 0:
-                       f.write("-" * 60 + "\n")
+                        f.write("-" * 60 + "\n")
                 f.write(f"--- Stage: {stage.name} (ALL GENERATIONS) ---\n")
                 f.write(stage_tb_cmd + "\n\n")
         except IOError as e:
-            print(f"⚠️ [TensorBoard] Could not write command to file: {e}")
+            pass # Ignore write error
 
         if scheduler_mode == "pbt_sequential":
             stage_checkpoint, stage_hparams = train_stage_sequential_pbt(
@@ -888,7 +811,6 @@ def main():
             final_best_hparams = None
 
         else:
-             print(f"Scheduler mode '{scheduler_mode}' not configured for stage execution.")
              break
 
         if stage_checkpoint:
@@ -903,16 +825,15 @@ def main():
     if current_checkpoint:
         print(f"Final Checkpoint Path: {current_checkpoint}")
     else:
-         print("No final checkpoint was generated (or training failed).")
+        print("No final checkpoint was generated (or training failed).")
 
     if final_best_hparams:
         print(f"HParams from last successful Sequential PBT stage: {final_best_hparams}")
     elif scheduler_mode == "pbt_parallel" and current_checkpoint:
-         print("Training finished in pbt_parallel mode. Final HParams determined by the PBT scheduler.")
+        print("Training finished in pbt_parallel mode. Final HParams determined by the PBT scheduler.")
     print("="*80 + "\n")
 
     ray.shutdown()
-
 
 if __name__ == "__main__":
     main()
