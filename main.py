@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
+from collections import deque
 
 import gfootball.env as football_env
 import numpy as np
@@ -38,10 +39,74 @@ class TrainingStage:
     target_reward: float
     max_timesteps: int
     description: str = ""
+    expected_reward_mean: float = 0.0
+    expected_reward_std: float = 1.0
+    reward_scale: float = 1.0
 
 TRAINING_STAGES = [
-    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, "1 attacker versus a goalkeeper: dribbles towards goal and finishes under light pressure."),
+    TrainingStage("stage_1_basic", "academy_empty_goal_close", "simple115v2", 1, 0, 0.75, 1_000_000, 
+                 "1 attacker, no opponents", expected_reward_mean=3.0, expected_reward_std=2.0, reward_scale=0.3),
+    TrainingStage("stage_2_basic", "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 0.75, 200_000_000, 
+                 "1 attacker versus goalkeeper", expected_reward_mean=1.0, expected_reward_std=1.5, reward_scale=1.0),
+    TrainingStage("stage_3_basic", "academy_pass_and_shoot_with_keeper", "simple115v2", 1, 0, 0.75, 5_000_000,
+                 "1 attacker with defender", expected_reward_mean=0.8, expected_reward_std=1.2, reward_scale=1.2),
+    TrainingStage("stage_4_1v1", "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 0.75, 10_000_000,
+                 "3 attackers vs 1 defender", expected_reward_mean=1.5, expected_reward_std=1.5, reward_scale=0.8),
+    TrainingStage("stage_5_3v0", "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1.0, 50_000_000,
+                 "3 vs 0 full field", expected_reward_mean=2.0, expected_reward_std=2.0, reward_scale=0.5),
+    TrainingStage("stage_6_transition", "11_vs_11_easy_stochastic", "simple115v2", 3, 3, 1.0, 100_000_000,
+                 "Small team in 11v11", expected_reward_mean=0.5, expected_reward_std=1.0, reward_scale=2.0),
+    TrainingStage("stage_7_midgame", "11_vs_11_easy_stochastic", "simple115v2", 5, 5, 1.0, 500_000_000,
+                 "3v3 in 11v11", expected_reward_mean=0.3, expected_reward_std=0.8, reward_scale=3.0),
+    TrainingStage("stage_8_fullgame", "11_vs_11_stochastic", "simple115v2", 5, 5, 1.0, 1_000_000_000,
+                 "Full 11v11", expected_reward_mean=0.1, expected_reward_std=0.5, reward_scale=5.0)
 ]
+
+class RunningStats:
+    def __init__(self, window_size=10000):
+        self.values = deque(maxlen=window_size)
+        self.mean = 0.0
+        self.std = 1.0
+        self.count = 0
+        
+    def update(self, value):
+        self.values.append(value)
+        self.count += 1
+        if len(self.values) >= 100:
+            self.mean = np.mean(self.values)
+            self.std = np.std(self.values) + 1e-8
+    
+    def normalize(self, value):
+        if self.count < 100:
+            return value
+        return (value - self.mean) / self.std
+
+class RewardNormalizer:
+    def __init__(self):
+        self.stage_stats = {}
+        self.global_stats = RunningStats(window_size=50000)
+        
+    def get_stats(self, stage_name):
+        if stage_name not in self.stage_stats:
+            self.stage_stats[stage_name] = RunningStats()
+        return self.stage_stats[stage_name]
+    
+    def update_and_normalize(self, reward, stage_name, stage_config):
+        stats = self.get_stats(stage_name)
+        stats.update(reward)
+        self.global_stats.update(reward)
+        
+        if stats.count < 100:
+            normalized = reward * stage_config.reward_scale
+        else:
+            z_score = (reward - stats.mean) / stats.std
+            target_reward = z_score * stage_config.expected_reward_std + stage_config.expected_reward_mean
+            normalized = target_reward * stage_config.reward_scale
+        
+        normalized = np.clip(normalized, -10.0, 10.0)
+        return normalized
+
+reward_normalizer = RewardNormalizer()
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
@@ -65,10 +130,15 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
 
         self.left_players = self.env_config["number_of_left_players_agent_controls"]
         self.right_players = self.env_config["number_of_right_players_agent_controls"]
+        
+        self.stage_config = self.env_config.get("stage_config", None)
+        self.stage_name = self.env_config.get("stage_name", "unknown")
 
         creation_kwargs = self.env_config.copy()
         creation_kwargs.pop("debug_mode", None)
         creation_kwargs.pop("_reset_render_state", None)
+        creation_kwargs.pop("stage_config", None)
+        creation_kwargs.pop("stage_name", None)
 
         try:
             self.env = football_env.create_environment(**creation_kwargs)
@@ -146,7 +216,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             self.env.render()
 
         agent_infos = {aid: info for aid in self.agent_ids}
-        return self._split_obs(obs), self._split_rewards(rewards), dones, truncs, agent_infos
+        return self._split_obs(obs), self._split_and_normalize_rewards(rewards), dones, truncs, agent_infos
 
     def _split_obs(self, obs):
         if not self.agent_ids: return {}
@@ -171,12 +241,30 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         zero_obs = np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
         return {aid: zero_obs.astype(np.float32) for aid in self.agent_ids}
 
-    def _split_rewards(self, rewards):
+    def _split_and_normalize_rewards(self, rewards):
+        global reward_normalizer
+        
         if np.isscalar(rewards):
-            return {aid: float(rewards) for aid in self.agent_ids}
+            if self.stage_config:
+                normalized = reward_normalizer.update_and_normalize(
+                    float(rewards), self.stage_name, self.stage_config
+                )
+            else:
+                normalized = float(rewards)
+            return {aid: normalized for aid in self.agent_ids}
+        
         if isinstance(rewards, (list, np.ndarray)):
             if len(rewards) == len(self.agent_ids):
-                return {self.agent_ids[i]: float(rewards[i]) for i in range(len(self.agent_ids))}
+                result = {}
+                for i in range(len(self.agent_ids)):
+                    if self.stage_config:
+                        normalized = reward_normalizer.update_and_normalize(
+                            float(rewards[i]), self.stage_name, self.stage_config
+                        )
+                    else:
+                        normalized = float(rewards[i])
+                    result[self.agent_ids[i]] = normalized
+                return result
             else:
                 return {aid: 0.0 for aid in self.agent_ids}
 
@@ -210,6 +298,8 @@ def create_impala_config(stage: TrainingStage,
         "number_of_right_players_agent_controls": stage.right_players,
         "rewards": "scoring,checkpoints",
         "stacked": True,
+        "stage_config": stage,
+        "stage_name": stage.name,
     }
     config.environment("gfootball_multi", env_config=env_config)
     config.framework("torch")
@@ -383,103 +473,55 @@ def mutate_hparams(hp: dict) -> dict:
 
     return {"lr": lr, "entropy_coeff": ent, "vf_loss_coeff": vf}
 
-
-# ====================================================================
-# NEW: ImpalaTrainable class that gives PBT control
-# ====================================================================
 class ImpalaTrainable(Trainable):
-    """
-    Diese Klasse kapselt die IMPALA-Logik und gibt PBT die Kontrolle.
-    PBT (der "Tuner") wird die 'step()'-Methode wiederholt aufrufen.
-    """
-    
     def setup(self, config):
-        """Wird einmal zu Beginn des Trials aufgerufen."""
-        
-        # Entferne die benutzerdefinierten Schlüssel aus der Konfiguration,
-        # bevor sie an Impala übergeben werden.
         restore_path = config.pop("_restore_from", None)
         self.stop_timesteps = config.pop("_stop_timesteps", None)
         self.stop_after = config.pop("_stop_after", None)
         self.pbt_interval = config.pop("_pbt_interval", None)
 
-        print(f"⚙️ [Trainable.setup] Initialisiere Impala...")
         self.algo = Impala(config=config)
-        
-        # Track starting timesteps for curriculum learning
         self.start_timesteps = 0
 
-        # Dies ist für das "Curriculum-Lernen":
-        # Wiederherstellen vom Checkpoint der VORHERIGEN Stufe.
         if restore_path:
-            print(f"🔄 [Trainable.setup] Stelle initialen Checkpoint wieder her: {restore_path}")
             try:
                 self.algo.restore(restore_path)
-                # Get the current timesteps from the restored checkpoint
                 if hasattr(self.algo, '_counters'):
                     self.start_timesteps = self.algo._counters.get("num_env_steps_sampled", 0)
                 elif self.algo.iteration > 0:
-                    # Try to get timesteps from a dummy train call
                     dummy_result = self.algo.train()
                     self.start_timesteps = dummy_result.get("timesteps_total", 0) - dummy_result.get("num_env_steps_sampled_this_iter", 0)
-                print(f"✅ [Trainable.setup] Initiales Wiederherstellen erfolgreich. Start timesteps: {self.start_timesteps}")
             except Exception as e:
-                print(f"⚠️ [Trainable.setup] FEHLER beim Wiederherstellen von {restore_path}: {e}. Starte von vorne.")
                 self.start_timesteps = 0
-        else:
-            print("📝 [Trainable.setup] Kein initialer Checkpoint. Starte frisch.")
 
     def step(self):
-        """
-        Wird von Tune/PBT wiederholt in einer Schleife aufgerufen.
-        Hier findet das eigentliche Training statt.
-        """
-        # Führe EINEN Trainingsschritt durch. Nicht Tausende.
-        # PBT ist jetzt die 'while'-Schleife.
         result = self.algo.train()
-        
-        # Check if we need to stop based on our custom criteria
         current_timesteps = result.get("timesteps_total", 0)
         
-        # Handle stop_after (relative timesteps from start)
         if self.stop_after is not None:
             target_timesteps = self.start_timesteps + self.stop_after
             if current_timesteps >= target_timesteps:
                 result["done"] = True
-                print(f"🛑 [Trainable.step] Reached stop_after limit: {current_timesteps} >= {target_timesteps}")
         
-        # Handle stop_timesteps (absolute timesteps)
         if self.stop_timesteps is not None:
             if current_timesteps >= self.stop_timesteps:
                 result["done"] = True
-                print(f"🛑 [Trainable.step] Reached stop_timesteps limit: {current_timesteps} >= {self.stop_timesteps}")
         
-        # Wir müssen nichts 'reporten', 'return result' reicht.
-        # Tune/PBT erhält dieses 'result' und prüft 'timesteps_total'.
         return result
 
     def save_checkpoint(self, checkpoint_dir):
-        """Wird von Tune aufgerufen, wenn ein Checkpoint gespeichert werden soll."""
         save_result = self.algo.save(checkpoint_dir)
         chk_path = save_result.checkpoint.path if hasattr(save_result, 'checkpoint') else save_result
-        print(f"📤 [Trainable.save] Checkpoint gespeichert in: {chk_path}")
-        # WICHTIG: Gib den Verzeichnispfad zurück
         return chk_path
 
     def load_checkpoint(self, checkpoint_path):
-        """Wird von PBT aufgerufen, um den Zustand eines besseren Trials zu laden."""
-        print(f"📥 [Trainable.load] Lade PBT-Checkpoint: {checkpoint_path}")
         try:
             self.algo.restore(checkpoint_path)
-            print(f"✅ [Trainable.load] PBT-Wiederherstellung erfolgreich.")
         except Exception as e:
-            print(f"⚠️ [Trainable.load] FEHLER beim Laden des PBT-Checkpoints {checkpoint_path}: {e}")
+            pass
 
     def cleanup(self):
-        """Wird aufgerufen, wenn der Trial stoppt."""
         self.algo.stop()
-        print("🛑 [Trainable.cleanup] Algorithmus gestoppt.")
-
 
 def train_stage_sequential_pbt(
     stage: TrainingStage,
@@ -488,7 +530,6 @@ def train_stage_sequential_pbt(
     start_checkpoint: Optional[str],
     metric_path: str = "env_runners/episode_return_mean",
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Sequential PBT mode - runs multiple generations sequentially with mutation."""
     generations = tune_config.get("generations", 6)
     candidates_per_gen = tune_config.get("candidates_per_gen", 4)
     steps_per_gen = tune_config.get("steps_per_gen", 200_000)
@@ -501,10 +542,6 @@ def train_stage_sequential_pbt(
 
     gen = 0
     while gen < generations:
-        print(f"\n{'='*60}")
-        print(f"Starting Generation {gen+1}/{generations} for stage: {stage.name}")
-        print(f"{'='*60}\n")
-        
         candidates = [deepcopy(best_hp)] + [mutate_hparams(best_hp) for _ in range(candidates_per_gen - 1)]
 
         base_cfg_obj = create_impala_config(
@@ -547,7 +584,7 @@ def train_stage_sequential_pbt(
         )
 
         tuner = tune.Tuner(
-            tune.with_resources(ImpalaTrainable, resources=resources_per_trial),  # CHANGED: Using ImpalaTrainable
+            tune.with_resources(ImpalaTrainable, resources=resources_per_trial),
             param_space=base_cfg,
             tune_config=tune.TuneConfig(
                 num_samples=1,
@@ -566,7 +603,6 @@ def train_stage_sequential_pbt(
         try:
             results = tuner.fit()
         except Exception as e:
-            print(f"⚠️ Error in generation {gen+1}: {e}")
             break
 
         if results.num_errors > 0:
@@ -582,24 +618,16 @@ def train_stage_sequential_pbt(
                 "vf_loss_coeff": float(cfg["vf_loss_coeff"]),
             }
             current_gen_best_ckpt = str(best_result.checkpoint.path)
-            current_gen_score = best_result.metrics.get(metric_path, -float('inf'))
 
             best_hp = current_gen_best_hp
             best_ckpt = current_gen_best_ckpt
-            
-            print(f"✅ Generation {gen+1} complete. Best score: {current_gen_score:.3f}")
-            print(f"   Best hyperparams: {best_hp}")
 
-        elif best_result:
-            print(f"⚠️ Generation {gen+1} had no checkpoint, keeping previous best")
-        else:
-            print(f"⚠️ Generation {gen+1} failed, stopping sequential PBT")
+        elif not best_result:
             break
 
         gen += 1
 
     return best_ckpt, best_hp
-
 
 def train_single_stage(stage: TrainingStage,
                        stage_index: int,
@@ -607,7 +635,6 @@ def train_single_stage(stage: TrainingStage,
                        scheduler_mode: str,
                        debug_mode: bool,
                        restore_checkpoint: Optional[str]) -> Optional[str]:
-    """Train a single stage with either parallel PBT or no scheduler."""
     
     results_path = Path(__file__).resolve().parent / "training_results_transfer"
     policy_pool_dir = results_path / f"{stage.name}_policy_pool"
@@ -663,7 +690,6 @@ def train_single_stage(stage: TrainingStage,
 
     scheduler = None
     if scheduler_mode == "pbt_parallel":
-        print(f"🎯 Using Parallel PBT scheduler for stage: {stage.name}")
         scheduler = PopulationBasedTraining(
             time_attr="timesteps_total",
             metric=metric_path,
@@ -673,7 +699,6 @@ def train_single_stage(stage: TrainingStage,
                 "lr": tune.loguniform(4e-5, 1e-4),
                 "entropy_coeff": tune.uniform(0.006, 0.012),
                 "vf_loss_coeff": tune.uniform(0.5, 1.0),
-
                 "gamma": [0.997, 0.9975, 0.998, 0.9985, 0.999],
                 "vtrace_clip_rho_threshold": [0.9, 1.0, 1.1],
                 "vtrace_clip_pg_rho_threshold": [0.9, 1.0, 1.1],
@@ -682,11 +707,9 @@ def train_single_stage(stage: TrainingStage,
             resample_probability=0.30,
             log_config=True,
         )
-    else:
-        print(f"📝 Running without scheduler for stage: {stage.name}")
 
     tuner = tune.Tuner(
-        tune.with_resources(ImpalaTrainable, resources=resources_per_trial),  # CHANGED: Using ImpalaTrainable
+        tune.with_resources(ImpalaTrainable, resources=resources_per_trial),
         param_space=param_space,
         tune_config=tune.TuneConfig(
             search_alg=search_alg,
@@ -706,7 +729,6 @@ def train_single_stage(stage: TrainingStage,
     try:
         results = tuner.fit()
     except Exception as e:
-        print(f"⚠️ Error during training: {e}")
         return None
 
     if results.experiment_path:
@@ -718,22 +740,18 @@ def train_single_stage(stage: TrainingStage,
                 f.write(f"--- Stage: {stage.name} ({scheduler_mode}) ---\n")
                 f.write(f"{tensorboard_command}\n\n")
         except IOError as e:
-            pass # Ignore write error
+            pass
 
     best_result = results.get_best_result(metric=metric_path, mode="max")
 
     if best_result and best_result.checkpoint:
         checkpoint_path = str(best_result.checkpoint.path)
-        print(f"✅ Stage {stage.name} complete. Best checkpoint: {checkpoint_path}")
         return checkpoint_path
     else:
-        print(f"⚠️ Stage {stage.name} produced no checkpoint")
         return None
 
-
 def main():
-    """Main training loop with curriculum learning across stages."""
-    scheduler_mode = "pbt_parallel"  # Options: "pbt_sequential", "pbt_parallel"
+    scheduler_mode = "pbt_parallel"
     
     tune_config = None
     if scheduler_mode == "pbt_sequential":
@@ -745,17 +763,17 @@ def main():
             "cpus_per_runner": 1,
             "candidates_per_gen": 2,
             "steps_per_gen": 1_000_000,
-            "generations": 6,  # Number of sequential generations
+            "generations": 6,
         }
 
     elif scheduler_mode == "pbt_parallel":
         tune_config = {
-            "num_trials": 2,  # Population size for PBT
+            "num_trials": 2,
             "max_concurrent": 2,
             "gpu_per_trial": 0.5,
             "num_env_runners": 120,
             "cpus_per_runner": 1,
-            "perturbation_interval": 1_000_000,  # PBT intervention frequency
+            "perturbation_interval": 1_000_000,
         }
     else:
         raise ValueError(f"Unknown SCHEDULER_MODE: {scheduler_mode}")
@@ -775,25 +793,12 @@ def main():
     final_best_hparams = None
     results_path = Path(__file__).resolve().parent / "training_results_transfer"
 
-    print("\n" + "="*80)
-    print("PROGRESSIVE TRAINING / CURRICULUM LEARNING")
-    print(f"Scheduler Mode: {scheduler_mode}")
-    print(f"Stages to train: {start_stage_index} to {end_stage_index}")
-    print("="*80 + "\n")
-
     for i in range(start_stage_index, end_stage_index + 1):
         stage = TRAINING_STAGES[i]
-        print(f"\n{'='*60}")
-        print(f"Stage {i+1}/{len(TRAINING_STAGES)}: {stage.name}")
-        print(f"Description: {stage.description}")
-        print(f"Environment: {stage.env_name}")
-        print(f"Target reward: {stage.target_reward}, Max timesteps: {stage.max_timesteps:,}")
-        print(f"{'='*60}\n")
         
         stage_checkpoint = None
         stage_hparams = {}
 
-        # Create stage directory and log tensorboard commands
         stage_root = results_path / stage.name
         stage_root.mkdir(parents=True, exist_ok=True)
         stage_tb_cmd = f'tensorboard --logdir "{stage_root}" --reload_multifile true --purge_orphaned_data true --window_title "{stage.name} - All Generations"'
@@ -805,10 +810,9 @@ def main():
                 f.write(f"--- Stage: {stage.name} (ALL GENERATIONS) ---\n")
                 f.write(stage_tb_cmd + "\n\n")
         except IOError as e:
-            pass # Ignore write error
+            pass
 
         if scheduler_mode == "pbt_sequential":
-            # Sequential PBT: multiple generations with mutation
             stage_checkpoint, stage_hparams = train_stage_sequential_pbt(
                 stage=stage,
                 tune_config=tune_config,
@@ -818,7 +822,6 @@ def main():
             final_best_hparams = stage_hparams
 
         elif scheduler_mode == "pbt_parallel":
-            # Parallel PBT: population-based training with real-time perturbation
             stage_checkpoint = train_single_stage(
                 stage=stage,
                 stage_index=i,
@@ -834,25 +837,8 @@ def main():
 
         if stage_checkpoint:
             current_checkpoint = stage_checkpoint
-            print(f"\n✅ Stage {i + 1} finished successfully.")
-            print(f"   Using checkpoint for next stage: {current_checkpoint}")
         else:
-            print(f"\n⚠️ Stage {i + 1} ({stage.name}) failed or produced no checkpoint.")
-            print("   Stopping progressive training.")
             break
-
-    print("\n" + "="*80)
-    print("PROGRESSIVE TRAINING / STAGE EXECUTION COMPLETE")
-    if current_checkpoint:
-        print(f"Final Checkpoint Path: {current_checkpoint}")
-    else:
-        print("No final checkpoint was generated (or training failed).")
-
-    if final_best_hparams:
-        print(f"HParams from last successful Sequential PBT stage: {final_best_hparams}")
-    elif scheduler_mode == "pbt_parallel" and current_checkpoint:
-        print("Training finished in pbt_parallel mode. Final HParams determined by the PBT scheduler.")
-    print("="*80 + "\n")
 
     ray.shutdown()
 
