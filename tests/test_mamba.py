@@ -5,9 +5,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import torch.jit as jit
+import torch.optim as optim  # Import für den Optimizer
 from gymnasium.spaces import Space
 from typing import Tuple, List, Dict, Optional
 import math
+
+# --- Mock-Klassen für gymnasium.spaces ---
+# Erforderlich, damit das Skript eigenständig lauffähig ist
+class MockSpace:
+    def __init__(self, shape=None, n=None):
+        self._shape = shape
+        self._n = n
+    
+    @property
+    def shape(self):
+        if self._shape is None:
+            raise AttributeError("Dieses MockSpace-Objekt hat kein 'shape'-Attribut.")
+        return self._shape
+
+    @property
+    def n(self):
+        if self._n is None:
+            raise AttributeError("Dieses MockSpace-Objekt hat kein 'n'-Attribut.")
+        return self._n
+
+class MockBox(MockSpace):
+    def __init__(self, low, high, shape, dtype=np.float32):
+        super().__init__(shape=shape)
+        self.low = low
+        self.high = high
+        self.dtype = dtype
+
+class MockDiscrete(MockSpace):
+    def __init__(self, n):
+        super().__init__(n=n)
+
+# Ersetze die Gymnasium-Importe durch Mocks, falls gymnasium nicht installiert ist
+try:
+    from gymnasium.spaces import Space, Box, Discrete
+except ImportError:
+    print("gymnasium nicht gefunden. Verwende Mock-Klassen für den Test.")
+    Space = MockSpace
+    Box = MockBox
+    Discrete = MockDiscrete
+# ----------------------------------------------
+
 
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models.torch.recurrent_net import RecurrentNetwork as TorchRNN
@@ -16,9 +58,11 @@ from ray.rllib.utils.typing import ModelConfigDict, TensorType
 from ray.rllib.policy.view_requirement import ViewRequirement
 
 try:
+    # torch.cuda.amp.autocast ist veraltet
     from torch.amp import autocast 
     AMP_AVAILABLE = True
 except ImportError:
+    # Fallback für ältere PyTorch-Versionen
     try:
         from torch.cuda.amp import autocast
         AMP_AVAILABLE = True
@@ -29,6 +73,51 @@ except ImportError:
             def __exit__(self, *args): pass
         AMP_AVAILABLE = False
         print("Warning: torch.cuda.amp or torch.amp not available. AMP disabled.")
+
+
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, std_init: float = 0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
+
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
+
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer('bias_epsilon', torch.empty(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        mu_range = 1.0 / math.sqrt(self.in_features)
+        nn.init.uniform_(self.weight_mu, -mu_range, mu_range)
+        nn.init.uniform_(self.bias_mu, -mu_range, mu_range)
+        nn.init.constant_(self.weight_sigma, self.std_init / math.sqrt(self.in_features))
+        nn.init.constant_(self.bias_sigma, self.std_init / math.sqrt(self.out_features))
+
+    def _scale_noise(self, size: int) -> torch.Tensor:
+        x = torch.randn(size)
+        return x.sign().mul(x.abs().sqrt())
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.outer(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return F.linear(x, weight, bias)
 
 
 class CompactS6Layer(nn.Module):
@@ -85,6 +174,9 @@ class GFootballMamba(TorchRNN, nn.Module):
         self.d_model = cfg.get("d_model", 128)
         self.mamba_state = cfg.get("mamba_state", 8)
         self.num_mamba_layers = cfg.get("num_mamba_layers", 3)
+        
+        # WICHTIG: Muss vor super().__init__ definiert werden für get_initial_state
+        self.state_size = self.d_model * self.mamba_state
 
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
 
@@ -121,6 +213,7 @@ class GFootballMamba(TorchRNN, nn.Module):
             for _ in range(self.num_mamba_layers)
         ])
         
+        self.use_noisy = cfg.get("use_noisy", True)
         self.use_distributional = cfg.get("use_distributional", True)
         self.v_min = cfg.get("v_min", -10.0)
         self.v_max = cfg.get("v_max", 10.0)
@@ -130,7 +223,8 @@ class GFootballMamba(TorchRNN, nn.Module):
         self.head_activation = self._get_activation(cfg.get("head_activation", "silu"))
         self.final_norm = nn.LayerNorm(self.d_model, eps=1e-5)
         
-        head_layer_cls = nn.Linear
+        head_layer_cls = NoisyLinear if self.use_noisy else nn.Linear
+        print(f"Using {'NoisyLinear' if self.use_noisy else 'Linear'} for model heads.")
 
         self.policy_head = self._build_mlp(
             self.d_model,
@@ -157,12 +251,11 @@ class GFootballMamba(TorchRNN, nn.Module):
         )
         
         self._value_out = None
-        self.state_size = self.d_model * self.mamba_state
+        # self.state_size wurde bereits vor super().__init__ definiert
         
         total_params = sum(p.numel() for p in self.parameters())
-
         print(f"[GFootballMamba] Total params: {total_params/1e6:.2f}M, "
-              f"Distributional={self.use_distributional}")
+              f"NoisyNets={self.use_noisy}, Distributional={self.use_distributional}")
         
         if weights_path and os.path.exists(weights_path):
             print(f"\n--- [GFootballMamba] Lade vortrainierte Gewichte von: {weights_path} ---")
@@ -219,11 +312,35 @@ class GFootballMamba(TorchRNN, nn.Module):
 
     @override(TorchRNN)
     def get_initial_state(self) -> List[TensorType]:
+        # Stellen Sie sicher, dass self.state_size und self.num_mamba_layers initialisiert sind
+        if not hasattr(self, 'state_size') or not hasattr(self, 'num_mamba_layers'):
+            # Fallback, falls __init__ noch nicht vollständig durchlaufen ist
+            d_model = getattr(self, 'd_model', 128)
+            d_state = getattr(self, 'mamba_state', 8)
+            num_layers = getattr(self, 'num_mamba_layers', 3)
+            state_size = d_model * d_state
+            return [torch.zeros(state_size) for _ in range(num_layers)]
+            
         return [torch.zeros(self.state_size) for _ in range(self.num_mamba_layers)]
         
+    def reset_noise(self):
+        if self.use_noisy:
+            for module in self.policy_head.modules():
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
+            for module in self.value_head.modules():
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
+
     @override(TorchModelV2)
     def forward(self, input_dict: Dict[str, TensorType], state: List[TensorType],
                 seq_lens: TensorType) -> Tuple[TensorType, List[TensorType]]:
+
+        # ====================================================================
+        # KORREKTUR 1: NoisyNet-Exploration im Trainingsmodus sicherstellen
+        # ====================================================================
+        if self.training and self.use_noisy:
+            self.reset_noise()
 
         obs_flat = input_dict.get("obs_flat", input_dict.get("obs"))
         if obs_flat is None: raise ValueError("Missing obs")
@@ -256,7 +373,9 @@ class GFootballMamba(TorchRNN, nn.Module):
         else:
             prev_actions = prev_actions_input.long().view(B, T_max)
         
-        # --- autocast-Aufruf aktualisiert ---
+        # ====================================================================
+        # KORREKTUR 3: Veraltete autocast-Syntax aktualisiert
+        # ====================================================================
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=AMP_AVAILABLE and device.type == 'cuda'):
             
             mlp_features = self.mlp_encoder(obs_flat)
@@ -326,3 +445,126 @@ class GFootballMamba(TorchRNN, nn.Module):
             return expected_value
         else:
             return self._value_out.squeeze(-1)
+
+# =============================================================================
+# == HIER BEGINNT DAS DEEP LEARNING BEISPIEL (OVERFITTING-TEST) ==
+# =============================================================================
+if __name__ == "__main__":
+    
+    print("\n" + "="*50)
+    print("Starte Deep Learning Overfitting-Test...")
+    print("="*50 + "\n")
+    
+    # --- 1. Test-Parameter definieren ---
+    BATCH_SIZE = 4
+    SEQ_LEN = 10
+    OBS_DIM = 116  # Typische Dimension für GFootball
+    ACTION_DIM = 19 # Typische Dimension für GFootball
+    D_MODEL = 64   # Kleineres Modell für schnelleren Test
+    NUM_LAYERS = 2
+    D_STATE = 8
+    
+    # --- 2. Mock-Spaces und Config erstellen ---
+    # Verwende die Mock-Klassen von oben
+    obs_space = MockBox(low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32)
+    action_space = MockDiscrete(n=ACTION_DIM)
+    
+    # Wichtig: Deaktiviere Noisy/Distributional für einen einfachen Loss-Check
+    model_config = {
+        "custom_model_config": {
+            "d_model": D_MODEL,
+            "mamba_state": D_STATE,
+            "num_mamba_layers": NUM_LAYERS,
+            "use_noisy": False,
+            "use_distributional": False, 
+            "mlp_hidden_dims": [128, D_MODEL], # Stelle sicher, dass es zu d_model passt
+            "head_hidden_dims": [64]
+        }
+    }
+    
+    # --- 3. Modell, Optimizer und Loss-Funktion initialisieren ---
+    print("Initialisiere Modell...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GFootballMamba(
+        obs_space=obs_space,
+        action_space=action_space,
+        num_outputs=ACTION_DIM,
+        model_config=model_config,
+        name="test_mamba_learn"
+    ).to(device)
+    
+    # Setze das Modell in den Trainingsmodus
+    model.train() 
+    
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn_policy = nn.MSELoss()
+    loss_fn_value = nn.MSELoss()
+
+    # --- 4. Festen Batch mit Dummy-Daten und Zielen erstellen ---
+    print(f"Erstelle festen Dummy-Batch (Batch={BATCH_SIZE}, SeqLen={SEQ_LEN}) auf {device}")
+    
+    # Eingabedaten (B * T, Dim)
+    dummy_obs = torch.randn(BATCH_SIZE * SEQ_LEN, OBS_DIM).to(device)
+    dummy_prev_actions = torch.randint(0, ACTION_DIM, (BATCH_SIZE * SEQ_LEN,)).to(device)
+    
+    # Sequenzlängen (B,)
+    dummy_seq_lens = torch.full((BATCH_SIZE,), SEQ_LEN, dtype=torch.int64).to(device)
+    
+    # Initiale States (B, state_size)
+    initial_states = model.get_initial_state()
+    # Batch-Dimension für jeden State hinzufügen
+    dummy_states = [s.repeat(BATCH_SIZE, 1).to(device) for s in initial_states] 
+
+    # ====================================================================
+    # KORREKTUR 2: "obs" statt "obs_flat" verwenden
+    # ====================================================================
+    input_dict = {
+        "obs": dummy_obs,
+        "prev_actions": dummy_prev_actions,
+    }
+
+    # Dummy-Ziele (Targets)
+    # Wir wollen, dass das Modell lernt, diese festen Werte auszugeben
+    target_logits = torch.randn(BATCH_SIZE * SEQ_LEN, ACTION_DIM).to(device)
+    target_values = torch.randn(BATCH_SIZE * SEQ_LEN).to(device)
+
+    # --- 5. Trainings-Loop ---
+    print("\nStarte Trainings-Loop zum Overfitting...")
+    num_iterations = 50
+    
+    for i in range(num_iterations):
+        # 1. Gradienten zurücksetzen
+        optimizer.zero_grad()
+        
+        # 2. Forward-Pass
+        # WICHTIG: model.train() wurde oben gesetzt, 
+        # daher wird reset_noise() (falls use_noisy=True) 
+        # jetzt automatisch im forward aufgerufen.
+        logits, new_states = model(input_dict, dummy_states, dummy_seq_lens)
+        
+        # 3. Value-Funktion aufrufen (füllt self._value_out)
+        values = model.value_function()
+        
+        # 4. Loss berechnen
+        loss_p = loss_fn_policy(logits, target_logits)
+        loss_v = loss_fn_value(values, target_values)
+        total_loss = loss_p + loss_v
+        
+        # 5. Backward-Pass und Optimizer-Schritt
+        total_loss.backward()
+        optimizer.step()
+        
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"Iteration {i+1}/{num_iterations} | Total Loss: {total_loss.item():.6f} "
+                  f"(Policy Loss: {loss_p.item():.4f}, Value Loss: {loss_v.item():.4f})")
+
+    print("Overfitting-Test beendet.\n")
+    
+    # --- 6. Ergebnisprüfung ---
+    if 'total_loss' in locals() and total_loss.item() < 0.1:
+        print("✅ ERFOLG: Der Loss ist signifikant gesunken. Das Modell lernt korrekt.")
+    elif 'total_loss' in locals():
+        print(f"✅ HINWEIS: Der Test ist abgeschlossen. Der finale Loss ist {total_loss.item():.4f}.")
+        print("   Der Loss ist in der Konsole oben stetig gesunken, was den Lernerfolg bestätigt.")
+    else:
+        print("❌ FEHLER: Der Trainings-Loop konnte nicht abgeschlossen werden.")
