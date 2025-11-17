@@ -245,7 +245,7 @@ def main():
         "enable_rl_module_and_learner": False,
         "enable_env_runner_and_connector_v2": False,
 
-        "num_workers": 11,
+        "num_workers": 127,
         "num_envs_per_worker": 1,
         "num_cpus_per_worker": 1,
         
@@ -305,8 +305,7 @@ def main():
     results = tuner.fit()
 
     print("Training abgeschlossen.")
-    # --- 2. Metrik-Namen bei der Auswertung anpassen ---
-    best_result = results.get_best_result(metric="episode_reward_mean", mode="max") # <-- GEÄNDERT
+    best_result = results.get_best_result(metric="episode_reward_mean", mode="max")
     
     if best_result:
         best_checkpoint = best_result.get_best_checkpoint(metric="episode_reward_mean", mode="max") # <-- GEÄNDERT
