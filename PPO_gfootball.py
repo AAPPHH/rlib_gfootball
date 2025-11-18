@@ -1,22 +1,29 @@
 import os
-import time
 from pathlib import Path
-import random
 from typing import Any, Dict
+
 import numpy as np
 from gymnasium import spaces
 import gfootball.env as football_env
+
 import ray
-from ray.rllib.algorithms.ppo import PPO
+from ray import tune
+from ray.rllib.algorithms.ppo import PPOConfig, PPO
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
 
+
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        ray_temp = os.environ.get("RAY_TEMP_DIR", "/tmp")
-        gf_logdir = os.path.join(ray_temp, "gf")
+
+        # Workspace-Root = Ordner, in dem dieses Script liegt
+        workspace_root = Path(__file__).resolve().parent
+
+        # Alle GFootball-Logs in den Workspace schreiben
+        gf_logdir = workspace_root / "gfootball_logs"
+        gf_logdir.mkdir(parents=True, exist_ok=True)
 
         default_config = {
             "env_name": "academy_run_to_score_with_keeper",
@@ -25,12 +32,12 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             "number_of_left_players_agent_controls": 1,
             "number_of_right_players_agent_controls": 0,
             "stacked": True,
-            "logdir": gf_logdir,
+            "logdir": str(gf_logdir),
             "write_goal_dumps": False,
             "write_full_episode_dumps": False,
             "render": False,
             "write_video": False,
-            "dump_frequency": 1,
+            "dump_frequency": 0,
         }
 
         self.env_config = {**default_config, **config}
@@ -118,7 +125,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         }
 
         self.latest_obs = self._split_obs(obs)
-        # agents-Liste für diese Episode (hier statisch)
         self.agents = list(self.agent_ids)
 
         return self.latest_obs, {aid: {} for aid in self.agent_ids}
@@ -127,7 +133,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         actions = [action_dict.get(aid, self.action_space.sample()) for aid in self.agent_ids]
         step_result = self.env.step(actions)
 
-        # gfootball kann 4- oder 5-Tuple liefern → wie im IMPALA-Env behandeln
         if len(step_result) == 5:
             obs, rewards, terminated, truncated, info = step_result
         elif len(step_result) == 4:
@@ -155,7 +160,6 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             return {}
         num_agents = len(self.agent_ids)
 
-        # IMPALA-Style: dict direkt durchlassen
         if isinstance(obs, dict):
             return obs
 
@@ -200,23 +204,41 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         self.env.close()
 
 
-def policy_mapping_fn(agent_id, episode, worker=None, **kwargs):
+def policy_mapping_fn(agent_id, episode=None, worker=None, **kwargs):
+    """Map agent IDs to policy IDs."""
     if agent_id.startswith("left"):
         return "policy_left"
     else:
         return "policy_right"
 
+
 def main():
-    ray.init()
-    
+    # Workspace-Root = Ordner, in dem dieses Script liegt
+    workspace_root = Path(__file__).resolve().parent
+
+    # Ray-Temp-Verzeichnis in den Workspace legen
+    ray_tmp_dir = workspace_root / "ray_tmp"
+    ray_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional auch als ENV setzen, falls irgendwas darauf schaut
+    os.environ["RAY_TMPDIR"] = str(ray_tmp_dir)
+    os.environ["RAY_TEMP_DIR"] = str(ray_tmp_dir)
+
+    ray.init(
+        include_dashboard=False,
+        ignore_reinit_error=True,
+        num_gpus=1,
+        _temp_dir=str(ray_tmp_dir),
+    )
+
     env_config = {
         "env_name": "11_vs_11_easy_stochastic",
         "number_of_left_players_agent_controls": 11,
         "number_of_right_players_agent_controls": 0,
     }
-    
+
     register_env("gfootball_multi", lambda cfg: GFootballMultiAgentEnv(cfg))
-    
+
     dummy_env = GFootballMultiAgentEnv(env_config)
     obs_space = dummy_env.observation_space
     act_space = dummy_env.action_space
@@ -224,7 +246,7 @@ def main():
 
     pbt_scheduler = PopulationBasedTraining(
         time_attr="training_iteration",
-        metric="episode_reward_mean",  # <-- GEÄNDERT
+        metric="episode_reward_mean",
         mode="max",
         perturbation_interval=20,
         resample_probability=0.0,
@@ -237,85 +259,94 @@ def main():
         },
     )
 
-    config = {
-        "env": "gfootball_multi",
-        "env_config": env_config,
-        "framework": "torch",
+    config = PPOConfig()
+    config = config.environment(
+        env="gfootball_multi",
+        env_config=env_config,
+    )
+    config = config.framework("torch")
 
-        "enable_rl_module_and_learner": False,
-        "enable_env_runner_and_connector_v2": False,
+    config = config.rollouts(
+        num_rollout_workers=10,
+        num_envs_per_worker=1,
+        batch_mode="complete_episodes",
+    )
 
-        "num_workers": 127,
-        "num_envs_per_worker": 1,
-        "num_cpus_per_worker": 1,
-        
-        "train_batch_size": 16384,
-        "sgd_minibatch_size": 1024,
-        "batch_mode": "complete_episodes",
-        
-        "num_sgd_iter": 5,
-        "gamma": 0.998,
-        "lr": 5e-6,
-        
-        "kl_coeff": 0.2,
-        "num_gpus": 0.5,
-        "log_level": "WARN",
-        "grad_clip": 0.5,
-        "model": {
-            "fcnet_hiddens": [256, 256],
-            "fcnet_activation": "silu",
-            "use_lstm": True,
-            "lstm_cell_size": 512,
-            "lstm_use_prev_action": True,
-            "lstm_use_prev_reward": False,
-            "vf_share_layers": True,
+    config = config.training(
+        train_batch_size=32768,
+        sgd_minibatch_size=8192,
+        num_sgd_iter=5,
+        lr=5e-6,
+        gamma=0.998,
+        entropy_coeff=0.01,
+        vf_loss_coeff=0.5,
+        grad_clip=0.5,
+        grad_clip_by="global_norm",
+        kl_coeff=0.2,
+        kl_target=0.01,
+        model={
+            "fcnet_hiddens": [512, 512],
+            "fcnet_activation": "relu",
         },
-        "multiagent": {
-            "policies": {
-                "policy_left": (None, obs_space, act_space, {}),
-                "policy_right": (None, obs_space, act_space, {}),
-            },
-            "policy_mapping_fn": policy_mapping_fn,
-            "policies_to_train": ["policy_left"],
+    )
+    config = config.resources(
+        num_cpus_for_local_worker=2,
+        num_gpus=0.5,
+    )
+    config = config.multi_agent(
+        policies={
+            "policy_left": (None, obs_space, act_space, {}),
+            "policy_right": (None, obs_space, act_space, {}),
         },
-    }
+        policy_mapping_fn=policy_mapping_fn,
+        policies_to_train=["policy_left"],
+    )
+    config = config.debugging(
+        log_level="WARN",
+    )
 
-    tuner = ray.tune.Tuner(
-            "PPO",
-            param_space=config,
-            run_config=ray.train.RunConfig(
-                name="PPO_GFootball_PBT",
-                stop={
-                    "episode_reward_mean": 20.0,  # <-- GEÄNDERT
-                    "training_iteration": 2_000_000,
-                },
-                checkpoint_config=ray.train.CheckpointConfig(
-                    checkpoint_frequency=20,
-                    checkpoint_at_end=True,
-                ),
-                storage_path=str(Path("ray_results").absolute()),
-            ),
-            tune_config=ray.tune.TuneConfig(
-                scheduler=pbt_scheduler,
-                num_samples=2
-            )
-        )
+    config_dict = config.to_dict()
 
     print("Starte Ray Tune Training mit PBT...")
-    results = tuner.fit()
+
+    results_dir = workspace_root / "ray_results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    analysis = tune.run(
+        PPO,
+        config=config_dict,
+        scheduler=pbt_scheduler,
+        num_samples=2,
+        stop={
+            "episode_reward_mean": 20.0,
+            "training_iteration": 2000,
+        },
+        local_dir=str(results_dir),
+        name="PPO_GFootball_PBT",
+        checkpoint_freq=20,
+        checkpoint_at_end=True,
+    )
 
     print("Training abgeschlossen.")
-    best_result = results.get_best_result(metric="episode_reward_mean", mode="max")
-    
-    if best_result:
-        best_checkpoint = best_result.get_best_checkpoint(metric="episode_reward_mean", mode="max") # <-- GEÄNDERT
-        print(f"Bestes Ergebnis erreicht:")
-        print(f"  Return Mean: {best_result.metrics['episode_reward_mean']}") # <-- GEÄNDERT
-        print(f"  Bester Checkpoint: {best_checkpoint.path}")
-    else:
-        print("Training beendet, aber kein bestes Ergebnis gefunden.")
 
-    
+    try:
+        best_trial = analysis.get_best_trial(
+            metric="episode_reward_mean",
+            mode="max",
+            scope="all",
+        )
+        best_result = best_trial.last_result
+        best_checkpoint = analysis.get_best_checkpoint(
+            best_trial,
+            metric="episode_reward_mean",
+            mode="max",
+        )
+        print("Bestes Ergebnis erreicht:")
+        print(f"  Return Mean: {best_result['episode_reward_mean']}")
+        print(f"  Bester Checkpoint: {best_checkpoint}")
+    except Exception as e:
+        print("Konnte bestes Ergebnis nicht bestimmen:", e)
+
     ray.shutdown()
 
 
