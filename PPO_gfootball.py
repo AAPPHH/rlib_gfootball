@@ -285,8 +285,13 @@ def main():
         kl_coeff=0.2,
         kl_target=0.01,
         model={
-            "fcnet_hiddens": [512, 512],
-            "fcnet_activation": "relu",
+            "fcnet_hiddens": [256, 128],
+            "fcnet_activation": "silu",
+            "use_lstm": True,
+            "lstm_cell_size": 512,
+            "lstm_use_prev_action": True,
+            "lstm_use_prev_reward": False,
+            "vf_share_layers": True,
         },
     )
     config = config.resources(
@@ -323,7 +328,7 @@ def main():
         },
         local_dir=str(results_dir),
         name="PPO_GFootball_PBT",
-        checkpoint_freq=20,
+        checkpoint_freq=5,
         checkpoint_at_end=True,
     )
 
