@@ -5,7 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import torch.jit as jit
+import gymnasium as gym
+from gymnasium import spaces
 from gymnasium.spaces import Space
+
 from typing import Tuple, List, Dict, Optional
 import math
 
@@ -85,6 +88,7 @@ class GFootballMamba(TorchRNN, nn.Module):
         self.d_model = cfg.get("d_model", 128)
         self.mamba_state = cfg.get("mamba_state", 8)
         self.num_mamba_layers = cfg.get("num_mamba_layers", 3)
+        self.num_stages = cfg.get("num_stages", 8)
 
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
 
@@ -95,7 +99,14 @@ class GFootballMamba(TorchRNN, nn.Module):
         self.prev_action_emb_dim = cfg.get("prev_action_emb", 16)
         self.use_checkpoint = cfg.get("gradient_checkpointing", False)
 
-        self.total_obs_dim = int(np.prod(obs_space.shape))
+        if hasattr(obs_space, "original_space"):
+            actual_obs_space = obs_space.original_space["obs"]
+        elif isinstance(obs_space, spaces.Dict) and "obs" in obs_space.spaces:
+             actual_obs_space = obs_space.spaces["obs"]
+        else:
+            actual_obs_space = obs_space
+            
+        self.total_obs_dim = int(np.prod(actual_obs_space.shape))
         self.mlp_hidden_dims = cfg.get("mlp_hidden_dims", [256, 128])
         self.mlp_activation = self._get_activation(cfg.get("mlp_activation", "silu"))
         
@@ -148,46 +159,51 @@ class GFootballMamba(TorchRNN, nn.Module):
             self.value_output_dim = 1
             print("Using Standard (Scalar) Critic.")
 
-        self.value_head = self._build_mlp(
-            self.d_model,
-            self.head_hidden_dims + [self.value_output_dim],
-            self.head_activation,
-            final_activation=None,
-            layer_cls=head_layer_cls
-        )
+        self.value_heads = nn.ModuleList([
+            self._build_mlp(
+                self.d_model,
+                self.head_hidden_dims + [self.value_output_dim],
+                self.head_activation,
+                final_activation=None,
+                layer_cls=head_layer_cls
+            )
+            for _ in range(self.num_stages)
+        ])
         
         self._value_out = None
+        self._current_stage_indices = None
         self.state_size = self.d_model * self.mamba_state
         
         total_params = sum(p.numel() for p in self.parameters())
 
         print(f"[GFootballMamba] Total params: {total_params/1e6:.2f}M, "
-              f"Distributional={self.use_distributional}")
+              f"Distributional={self.use_distributional}, "
+              f"NumStages={self.num_stages}")
         
         if weights_path and os.path.exists(weights_path):
-            print(f"\n--- [GFootballMamba] Lade vortrainierte Gewichte von: {weights_path} ---")
+            print(f"\n--- [GFootballMamba] Loading pretrained weights from: {weights_path} ---")
             try:
                 state_dict = torch.load(weights_path, map_location=torch.device("cpu"))
                 
                 missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
                 
-                print(f"[GFootballMamba] Gewichte geladen.")
+                print(f"[GFootballMamba] Weights loaded.")
                 if missing_keys:
-                        print(f"  > Fehlende Schlüssel (im Modell, nicht in .pth): {missing_keys}")
+                        print(f" 	> Missing keys: {missing_keys}")
                 if unexpected_keys:
-                        print(f"  > Unerwartete Schlüssel (in .pth, nicht im Modell): {unexpected_keys}")
+                        print(f" 	> Unexpected keys: {unexpected_keys}")
                 print("-------------------------------------------------------------------\n")
                 
             except Exception as e:
-                print(f"\n--- [GFootballMamba] WARNUNG: Fehler beim Laden der Gewichte von {weights_path}: {e} ---")
+                print(f"\n--- [GFootballMamba] WARNING: Error loading weights from {weights_path}: {e} ---")
                 import traceback
                 traceback.print_exc()
         
         elif weights_path:
-            print(f"\n--- [GFootballMamba] WARNUNG: Pfad für Gewichte angegeben, aber nicht gefunden: {weights_path} ---")
+            print(f"\n--- [GFootballMamba] WARNING: Weights path specified but not found: {weights_path} ---")
         
         else:
-            print("\n--- [GFootballMamba] Keine vortrainierten Gewichte angegeben, starte Training von Grund auf. ---")
+            print("\n--- [GFootballMamba] No pretrained weights specified, starting training from scratch. ---")
 
     def _get_activation(self, name: str) -> nn.Module:
         if name == 'silu': return nn.SiLU()
@@ -223,11 +239,25 @@ class GFootballMamba(TorchRNN, nn.Module):
         
     @override(TorchModelV2)
     def forward(self, input_dict: Dict[str, TensorType], state: List[TensorType],
-                seq_lens: TensorType) -> Tuple[TensorType, List[TensorType]]:
+                 seq_lens: TensorType) -> Tuple[TensorType, List[TensorType]]:
 
-        obs_flat = input_dict.get("obs_flat", input_dict.get("obs"))
+        if isinstance(input_dict["obs"], dict):
+            obs_flat = input_dict["obs"]["obs"]
+            stage_indices = input_dict["obs"]["stage_index"]
+        else:
+            obs_flat = input_dict.get("obs_flat", input_dict.get("obs"))
+            stage_indices = torch.zeros((obs_flat.shape[0], 1), dtype=torch.long, device=obs_flat.device)
+            
         if obs_flat is None: raise ValueError("Missing obs")
+        
+        if obs_flat.dim() > 2:
+            batch_size = obs_flat.shape[0]
+            feature_size = obs_flat.shape[1:].numel()
+            obs_flat = obs_flat.reshape(batch_size, feature_size)
+
         BT, obs_dim = obs_flat.shape; device = obs_flat.device
+        
+        self._current_stage_indices = stage_indices.view(BT).long()
         
         if "prev_actions" in input_dict:
             prev_actions_input = input_dict["prev_actions"]
@@ -284,13 +314,20 @@ class GFootballMamba(TorchRNN, nn.Module):
             
             if self.use_checkpoint and self.training:
                 policy_logits_raw = checkpoint(self.policy_head, x_core_flat, use_reentrant=False)
-                value_raw = checkpoint(self.value_head, x_core_flat, use_reentrant=False)
             else:
                 policy_logits_raw = self.policy_head(x_core_flat)
-                value_raw = self.value_head(x_core_flat)
+
+            value_outputs = []
+            for i in range(BT):
+                stage_idx = self._current_stage_indices[i].item()
+                stage_idx = min(stage_idx, self.num_stages - 1)
+                value_head = self.value_heads[stage_idx]
+                value_out = value_head(x_core_flat[i:i+1])
+                value_outputs.append(value_out)
+            
+            value_raw = torch.cat(value_outputs, dim=0)
 
             logits = policy_logits_raw.float() 
-            
             self._value_out = value_raw.float()
                 
         if "action_mask" in input_dict:
