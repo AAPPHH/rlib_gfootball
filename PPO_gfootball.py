@@ -13,15 +13,16 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.tune.registry import register_env
 from ray.tune.schedulers import PopulationBasedTraining
 
+from ray.rllib.models import ModelCatalog
+
+from model_3 import GFootballMamba
 
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
 
-        # Workspace-Root = Ordner, in dem dieses Script liegt
         workspace_root = Path(__file__).resolve().parent
 
-        # Alle GFootball-Logs in den Workspace schreiben
         gf_logdir = workspace_root / "gfootball_logs"
         gf_logdir.mkdir(parents=True, exist_ok=True)
 
@@ -213,14 +214,11 @@ def policy_mapping_fn(agent_id, episode=None, worker=None, **kwargs):
 
 
 def main():
-    # Workspace-Root = Ordner, in dem dieses Script liegt
     workspace_root = Path(__file__).resolve().parent
 
-    # Ray-Temp-Verzeichnis in den Workspace legen
     ray_tmp_dir = workspace_root / "ray_tmp"
     ray_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional auch als ENV setzen, falls irgendwas darauf schaut
     os.environ["RAY_TMPDIR"] = str(ray_tmp_dir)
     os.environ["RAY_TEMP_DIR"] = str(ray_tmp_dir)
 
@@ -232,8 +230,8 @@ def main():
     )
 
     env_config = {
-        "env_name": "11_vs_11_easy_stochastic",
-        "number_of_left_players_agent_controls": 11,
+        "env_name": "academy_run_to_score_with_keeper",
+        "number_of_left_players_agent_controls": 1,
         "number_of_right_players_agent_controls": 0,
     }
 
@@ -243,7 +241,7 @@ def main():
     obs_space = dummy_env.observation_space
     act_space = dummy_env.action_space
     dummy_env.close()
-
+    
     pbt_scheduler = PopulationBasedTraining(
         time_attr="training_iteration",
         metric="episode_reward_mean",
@@ -272,6 +270,8 @@ def main():
         batch_mode="complete_episodes",
     )
 
+    ModelCatalog.register_custom_model("GFootballMamba", GFootballMamba)
+    
     config = config.training(
         train_batch_size=32768,
         sgd_minibatch_size=8192,
@@ -285,14 +285,24 @@ def main():
         kl_coeff=0.2,
         kl_target=0.01,
         model={
-            "fcnet_hiddens": [256, 128],
-            "fcnet_activation": "silu",
-            "use_lstm": True,
-            "lstm_cell_size": 512,
-            "lstm_use_prev_action": True,
-            "lstm_use_prev_reward": False,
-            "vf_share_layers": True,
+        "custom_model": "GFootballMamba",
+        "max_seq_len": 256,
+        "custom_model_config": {
+            "d_model": 128,
+            "mamba_state": 16,
+            "num_mamba_layers": 6,
+            "prev_action_emb": 16,
+            "gradient_checkpointing": False,
+            "mlp_hidden_dims": [256, 256],
+            "mlp_activation": "silu",
+            "head_hidden_dims": [256],
+            "head_activation": "silu",
+            "use_distributional": True,
+            "v_min": -10.0,
+            "v_max": 10.0,
+            "num_atoms": 51,
         },
+    },
     )
     config = config.resources(
         num_cpus_for_local_worker=2,

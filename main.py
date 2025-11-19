@@ -321,7 +321,6 @@ def create_impala_config(
             "v_min": -10.0,
             "v_max": 10.0,
             "num_atoms": 51,
-            "pretrained_weights_path": r"/home/john/rlib_gfootball/cold_start/mamba_distillation_training/checkpoint_epoch_40.pth",
         },
     }
 

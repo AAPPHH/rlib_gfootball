@@ -252,11 +252,10 @@ class GFootballMamba(TorchRNN, nn.Module):
 
             seq_mask = torch.arange(T_max_pad, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)
             BT = B_pad * T_max_pad
-            B, T_max = B_pad, T_max_pad # Wichtig: B und T_max aktualisieren
+            B, T_max = B_pad, T_max_pad
         else:
             prev_actions = prev_actions_input.long().view(B, T_max)
         
-        # --- autocast-Aufruf aktualisiert ---
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=AMP_AVAILABLE and device.type == 'cuda'):
             
             mlp_features = self.mlp_encoder(obs_flat)
