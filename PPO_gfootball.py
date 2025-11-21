@@ -17,10 +17,11 @@ from ray.tune.schedulers import PopulationBasedTraining
 from ray.rllib.core.rl_module.rl_module import RLModuleSpec
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
 from ray.rllib.callbacks.callbacks import RLlibCallback
-from ray.rllib.evaluation.episode_v2 import EpisodeV2
 
+# Dein Mamba-Model
 from model_3 import GFootballMambaRLModule
 
+# --- Stage Logic ---
 class TrainingStage:
     def __init__(self, stage_id: int, env_name: str, representation: str, difficulty: int,
                  left_agents: int = 1, right_agents: int = 0):
@@ -47,19 +48,23 @@ TRAINING_STAGES = [
     TrainingStage(7, "11_vs_11_stochastic", "simple115v2", 8, left_agents=11, right_agents=0)
 ]
 
+# --- Environment ---
 class GFootballMultiAgentEnv(MultiAgentEnv):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         workspace_root = Path(__file__).resolve().parent
         gf_logdir = workspace_root / "gfootball_logs"
         gf_logdir.mkdir(parents=True, exist_ok=True)
+        
         self.curriculum_horizon = config.get("curriculum_horizon", 100000)
         self.ema_alpha = config.get("ema_alpha", 0.02)
         self.popart_epsilon = config.get("popart_epsilon", 1e-5)
+        
         self.stages = TRAINING_STAGES.copy()
         self.episode_idx = 0
         self.current_stage = None
         self.current_stage_id = -1
+        
         self.env_base_config = {
             "write_goal_dumps": False,
             "write_full_episode_dumps": False,
@@ -69,23 +74,36 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             "logdir": str(gf_logdir),
             "other_config_options": {} 
         }
+        
         self.debug_mode = config.get("debug_mode", False)
         if self.debug_mode:
             self.env_base_config["render"] = True
+            
         self.env = None
+        
+        # Agent IDs definieren
         self.agent_ids = [f"left_{i}" for i in range(11)] + [f"right_{i}" for i in range(11)]
         self._agent_ids = set(self.agent_ids)
         
+        # --- PRAGMATISCHE SPACE DEFINITION ---
+        # 1. Wir definieren den Space für EINEN Agenten (so wie du es willst)
         low_f32 = np.float32(-np.inf)
         high_f32 = np.float32(np.inf)
-        
-        self.observation_space = spaces.Dict({
+        self._single_observation_space = spaces.Dict({
             "obs": spaces.Box(low=low_f32, high=high_f32, shape=(4, 115), dtype=np.float32),
             "stage_index": spaces.Box(low=0, high=len(self.stages), shape=(1,), dtype=np.int32)
         })
-        self.action_space = spaces.Dict({
-            aid: spaces.Discrete(19) for aid in self.agent_ids
+        self._single_action_space = spaces.Discrete(19)
+
+        # 2. ABER: Wir müssen es als Dict wrappen, sonst crasht 'SyncVectorMultiAgentEnv'
+        #    (Siehe Traceback: "TypeError: 'Discrete' object is not iterable")
+        self.observation_space = spaces.Dict({
+            aid: self._single_observation_space for aid in self.agent_ids
         })
+        self.action_space = spaces.Dict({
+            aid: self._single_action_space for aid in self.agent_ids
+        })
+        
         self.latest_obs = {}
         self.episode_raw_returns = []
         self._create_env_for_stage(self.stages[0])
@@ -102,6 +120,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
         self.env = football_env.create_environment(**kwargs)
         self.current_stage = stage
         self.current_stage_id = stage.stage_id
+        # Nur die Agenten, die in DIESER Stage wirklich existieren
         self.active_agents = [f"left_{i}" for i in range(stage.left_agents)] + \
                              [f"right_{i}" for i in range(stage.right_agents)]
         
@@ -133,7 +152,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
              internal_limit = self.env.action_space.n
         elif hasattr(self.env, 'action_space') and isinstance(self.env.action_space, list):
              if len(self.env.action_space) > 0 and hasattr(self.env.action_space[0], 'n'):
-                  internal_limit = self.env.action_space[0].n
+                 internal_limit = self.env.action_space[0].n
 
         actions_list = []
         for aid in self.active_agents:
@@ -147,6 +166,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             
         obs, rewards, done, info = self.env.step(actions_list)
         self.latest_obs = self._process_obs(obs)
+        
         rewards_dict = {}
         raw_rewards_list = rewards if isinstance(rewards, (list, np.ndarray)) else [rewards]
         step_reward_sum = 0.0
@@ -154,17 +174,22 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             val = float(raw_rewards_list[i]) if i < len(raw_rewards_list) else 0.0
             rewards_dict[aid] = val
             step_reward_sum += val
+            
         self.episode_raw_returns.append(step_reward_sum / len(self.active_agents))
+        
         scale = max(self.current_stage.ema_abs_return, self.popart_epsilon)
         scaled_rewards = {k: v / scale for k, v in rewards_dict.items()}
+        
         terminated = bool(done)
         truncated = False
         dones = {aid: terminated for aid in self.active_agents}
         dones["__all__"] = terminated
         truncs = {aid: truncated for aid in self.active_agents}
         truncs["__all__"] = truncated
+        
         if terminated:
             self._update_stage_stats()
+            
         agent_infos = {}
         for aid in self.active_agents:
             agent_infos[aid] = {
@@ -175,6 +200,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             }
             if isinstance(info, dict):
                 agent_infos[aid].update(info)
+                
         return self.latest_obs, scaled_rewards, dones, truncs, agent_infos
 
     def _process_obs(self, raw_obs):
@@ -184,16 +210,19 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
             raw_obs = raw_obs.reshape(1, 460)
         elif raw_obs.size == 1:
             raw_obs = np.zeros((len(self.active_agents), 460), dtype=np.float32)
+            
         obs_dict = {}
         for i, aid in enumerate(self.active_agents):
             if i < len(raw_obs):
                 data = raw_obs[i]
             else:
                 data = np.zeros(460, dtype=np.float32)
+            
             if data.size == 460:
                 data = data.reshape(4, 115).astype(np.float32)
             else:
                 data = np.zeros((4, 115), dtype=np.float32)
+            
             obs_dict[aid] = {
                 "obs": data,
                 "stage_index": np.array([self.current_stage_id], dtype=np.int32)
@@ -210,6 +239,7 @@ class GFootballMultiAgentEnv(MultiAgentEnv):
     def close(self):
         if self.env: self.env.close()
 
+# --- Callbacks ---
 class StageReturnCallbacks(RLlibCallback):
     def on_episode_end(self, *, episode, **kwargs):
         agent_ids = list(episode.agent_ids)
@@ -229,15 +259,18 @@ class StageReturnCallbacks(RLlibCallback):
                 agent_info = episode._agent_to_last_info.get(first_agent)
         if agent_info is None:
             return
+            
         stage_id = agent_info.get("stage_id", -1)
         scale = agent_info.get("popart_scale", 1.0)
         raw_ret = agent_info.get("team_raw_reward", 0.0)
         norm_ret = raw_ret / max(scale, 1e-5)
+        
         metrics = {
             "popart_normalized_return_mean": norm_ret,
             f"stage_{stage_id}_return": raw_ret,
             "current_stage": stage_id
         }
+        
         if hasattr(episode, "add_custom_metrics"):
             episode.add_custom_metrics(metrics)
         elif hasattr(episode, "custom_metrics") and isinstance(episode.custom_metrics, dict):
@@ -246,6 +279,7 @@ class StageReturnCallbacks(RLlibCallback):
 def policy_mapping_fn(agent_id, episode=None, **kwargs):
     return "policy_left" if agent_id.startswith("left") else "policy_right"
 
+# --- Main ---
 def main():
     root = Path(__file__).parent
     res_dir = root / "ray_results"
@@ -253,14 +287,24 @@ def main():
     res_dir.mkdir(exist_ok=True)
     tmp_dir.mkdir(exist_ok=True)
     os.environ["RAY_TMPDIR"] = str(tmp_dir)
+    
     ray.init(num_gpus=1, _temp_dir=str(tmp_dir), ignore_reinit_error=True)
     register_env("gfootball_multi", lambda cfg: GFootballMultiAgentEnv(cfg))
+    
+    # -----------------------------------------------------------
+    # DER PRAGMATISCHE BRÜCKENSCHLAG
+    # -----------------------------------------------------------
+    # Wir brauchen die "Single Spaces" für das RLModule.
+    # Da das Env (wegen EnvRunner) ein Dict sein MUSS, holen wir uns hier
+    # explizit den Space EINES Agenten raus. Das ist kein Hack, das ist 
+    # Type-Casting von "Env-Sprache" (Alle) zu "Agent-Sprache" (Einer).
     dummy = GFootballMultiAgentEnv({})
-    obs_space = dummy.observation_space
-    act_space = dummy.action_space["left_0"]
+    single_obs_space = dummy._single_observation_space 
+    single_act_space = dummy._single_action_space
     dummy.close()
     del dummy
-    
+    # -----------------------------------------------------------
+
     model_config = {
         "d_model": 48, "mamba_state": 6, "num_mamba_layers": 6,
         "prev_action_emb": 8, "gradient_checkpointing": True,
@@ -274,8 +318,8 @@ def main():
         rl_module_specs={
             p: RLModuleSpec(
                 module_class=GFootballMambaRLModule,
-                observation_space=obs_space,
-                action_space=act_space,
+                observation_space=single_obs_space, # <- Discrete/Box (Single Agent)
+                action_space=single_act_space,      # <- Discrete (Single Agent)
                 model_config=model_config
             ) for p in ["policy_left", "policy_right"]
         }
@@ -293,7 +337,6 @@ def main():
             enable_rl_module_and_learner=True,
             enable_env_runner_and_connector_v2=True
         )
-        # HIER: Default Connectors explizit aktivieren
         .env_runners(
             num_env_runners=11,
             num_envs_per_env_runner=1,
@@ -302,7 +345,6 @@ def main():
             add_default_connectors_to_env_to_module_pipeline=True,
             add_default_connectors_to_module_to_env_pipeline=True,
         )
-        # HIER: GAE und Critic explizit aktivieren
         .training(
             train_batch_size=4000, 
             minibatch_size=1000,

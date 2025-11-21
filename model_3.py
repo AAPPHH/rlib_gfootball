@@ -408,4 +408,4 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
     @override(ValueFunctionAPI)
     def compute_values(self, batch: Dict[str, TensorType], **kwargs) -> TensorType:
         out = self._forward(batch, explore=False, inference=False)
-        return out["vf_preds"].float() # Auch hier float32
+        return out["vf_preds"].float()
