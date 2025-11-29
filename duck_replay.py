@@ -53,11 +53,10 @@ class ReplayStorage:
         self.episode_counter: int = 0
         self.run_start_time: float = 0
         
-        # Use Arrow for zero-copy data handling
         self._arrow_buffer: List[pa.RecordBatch] = []
         self._arrow_episode_buffer: List[pa.RecordBatch] = []
         self._buffer_size_bytes = 0
-        self._max_buffer_bytes = 500 * 1024 * 1024  # 500MB
+        self._max_buffer_bytes = 500 * 1024 * 1024 
         
         # Define schemas upfront
         self._init_schemas()
@@ -258,22 +257,17 @@ class ReplayStorage:
         if not self._arrow_buffer:
             return
         
-        # Combine all batches into a single table
         table = pa.Table.from_batches(self._arrow_buffer, schema=self.transition_schema)
         
-        # Write with partitioning using PyArrow (C++ implementation)
         run_dir = self.base_dir / "runs" / self.current_run_id / "raw_transitions"
         
-        # Use PyArrow's partitioning for zero-copy writes
         timestamp = int(time.time() * 1000)
         
-        # Create partition columns
         table = table.append_column(
             'episode_partition', 
             pa.compute.divide(table['episode_id'], pa.scalar(self.partition_size))
         )
-        
-        # Write partitioned dataset
+
         pq.write_to_dataset(
             table,
             root_path=str(run_dir),
@@ -284,7 +278,6 @@ class ReplayStorage:
             basename_template=f'batch_{timestamp}_{{i}}.parquet'
         )
         
-        # Clear buffers
         self._arrow_buffer.clear()
         self._buffer_size_bytes = 0
     
@@ -293,7 +286,6 @@ class ReplayStorage:
         if not self._arrow_episode_buffer:
             return
         
-        # Combine all batches
         table = pa.Table.from_batches(self._arrow_episode_buffer, schema=self.episode_schema)
         
         run_dir = self.base_dir / "runs" / self.current_run_id / "episodes"

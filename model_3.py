@@ -13,21 +13,8 @@ from ray.rllib.core.rl_module.apis.value_function_api import ValueFunctionAPI
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.typing import TensorType
 
-try:
-    from torch.amp import autocast 
-    AMP_AVAILABLE = True
-except ImportError:
-    try:
-        from torch.cuda.amp import autocast
-        AMP_AVAILABLE = True
-    except ImportError:
-        class autocast:
-            def __init__(self, *args, **kwargs): pass
-            def __enter__(self): pass
-            def __exit__(self, *args): pass
-        AMP_AVAILABLE = False
-
 AMP_AVAILABLE = False
+
 
 class CompactS6Layer(nn.Module):
     def __init__(self, d_model: int, d_state: int = 8):
@@ -47,12 +34,6 @@ class CompactS6Layer(nn.Module):
     
     def forward(self, x: torch.Tensor, h_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x.shape
-        expected_h_size = B * self.d_model * self.d_state
-        
-        if h_prev.numel() != expected_h_size:
-            if h_prev.numel() > expected_h_size:
-                 h_prev = h_prev[:B]
-        
         h = h_prev.view(B, self.d_model, self.d_state)
         
         x_norm = self.norm(x)
@@ -73,14 +54,11 @@ class CompactS6Layer(nn.Module):
             
             dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
             update_term = (dt_t * x_in_t).unsqueeze(-1) * B_t_t.unsqueeze(1)
-            
             h = dA * h + update_term
-            
             y_t = (h * C_t_t.unsqueeze(1)).sum(dim=-1)
             outputs.append(y_t.unsqueeze(1))
             
         y = torch.cat(outputs, dim=1)
-        
         ssm_out = y * F.silu(z) + x_in * self.D 
         out = self.out_proj(ssm_out)
         x_out = x + out
@@ -92,15 +70,15 @@ class CompactS6Layer(nn.Module):
 class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
     @override(RLModule)
     def setup(self):
-        cfg = self.config.model_config_dict
+        cfg = self.model_config
         
         self.d_model = cfg.get("d_model", 128)
         self.mamba_state = cfg.get("mamba_state", 8)
         self.num_mamba_layers = cfg.get("num_mamba_layers", 3)
         self.num_stages = cfg.get("num_stages", 8)
         
-        obs_space = self.config.observation_space
-        action_space = self.config.action_space
+        obs_space = self.observation_space
+        action_space = self.action_space
         
         if isinstance(obs_space, spaces.Dict) and "obs" in obs_space.spaces:
             actual_obs_space = obs_space.spaces["obs"]
@@ -185,15 +163,14 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
         return activations.get(name, nn.SiLU())
     
     def _build_mlp(self, in_dim: int, hidden_dims: List[int],
-                      activation: nn.Module,
-                      final_activation: Optional[nn.Module] = None,
-                      add_final_norm: bool = False) -> nn.Module:
+                   activation: nn.Module,
+                   final_activation: Optional[nn.Module] = None,
+                   add_final_norm: bool = False) -> nn.Module:
         layers = []
         current_dim = in_dim
         for i, h_dim in enumerate(hidden_dims):
             is_last = (i == len(hidden_dims) - 1)
             layers.append(nn.Linear(current_dim, h_dim))
-            
             if is_last:
                 if add_final_norm:
                     layers.append(nn.LayerNorm(h_dim, eps=1e-5))
@@ -214,6 +191,9 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
     
     def _process_observation(self, obs_flat: torch.Tensor) -> Tuple[torch.Tensor, int, int, bool]:
         has_time_dim = False
+        
+        if obs_flat.dtype != torch.float32:
+            obs_flat = obs_flat.float()
 
         if obs_flat.dim() == 4:
             T, B, stack, feats = obs_flat.shape
@@ -248,118 +228,106 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
         else:
             obs_flat = batch["obs"]
             if obs_flat.dim() >= 2:
-                batch_size = obs_flat.shape[0]
+                batch_size_est = obs_flat.shape[0]
             else:
-                batch_size = 1
-            stage_indices = torch.zeros(batch_size, 1, dtype=torch.long, device=obs_flat.device)
+                batch_size_est = 1
+            stage_indices = torch.zeros(batch_size_est, 1, dtype=torch.long, device=obs_flat.device)
         
         obs_flat, B, T_max, has_time_dim = self._process_observation(obs_flat)
         
         device = obs_flat.device
         BT = B * T_max
-        
         obs_flat = obs_flat.reshape(BT, 460)
         
         if stage_indices.dim() == 1:
             stage_indices = stage_indices.unsqueeze(-1)
         if stage_indices.dim() == 2:
-            if T_max > 1:
+            if T_max > 1 and stage_indices.shape[0] == B:
                 stage_indices = stage_indices.unsqueeze(1).expand(-1, T_max, -1)
-            else:
+            elif stage_indices.shape[0] == B:
                 stage_indices = stage_indices.view(B, 1, 1)
-        elif stage_indices.dim() == 3:
-            pass
         
         stage_indices_flat = stage_indices.reshape(BT, -1).squeeze(-1).long()
         
         if "prev_actions" in batch:
             prev_actions = batch["prev_actions"]
             if prev_actions.dim() == 1:
-                prev_actions = prev_actions.unsqueeze(0)
-            if prev_actions.numel() != BT:
-                if prev_actions.shape[0] == B:
+                if prev_actions.shape[0] == B and T_max > 1:
                     prev_actions = prev_actions.unsqueeze(1).expand(B, T_max)
+            if prev_actions.numel() == BT:
+                prev_actions_flat = prev_actions.reshape(BT).long()
+            else:
+                prev_actions_flat = torch.full((BT,), self.num_actions, dtype=torch.long, device=device)
         else:
-            prev_actions = torch.full((BT,), self.num_actions, dtype=torch.long, device=device)
-        
-        prev_actions_flat = prev_actions.reshape(BT).long()
+            prev_actions_flat = torch.full((BT,), self.num_actions, dtype=torch.long, device=device)
         
         state_in = {}
         for i in range(self.num_mamba_layers):
             key = f"h_{i}"
             if key in batch:
                 state_tensor = batch[key]
-                
                 if state_tensor.dim() == 3: 
                     state_tensor = state_tensor[:, 0, :] 
-                elif state_tensor.shape[0] == B * T_max and T_max > 1:
-                    state_tensor = state_tensor.view(B, T_max, -1)[:, 0, :]
-                
                 if state_tensor.shape[0] != B:
                     if state_tensor.shape[0] == 1 and B > 1:
                         state_tensor = state_tensor.expand(B, -1)
                     elif B == 1:
                         state_tensor = state_tensor[:1]
-                state_in[i] = state_tensor
+                    else:
+                        state_tensor = torch.zeros((B, self.state_size), device=device)
+                state_in[i] = state_tensor.contiguous()
             else:
                 state_in[i] = torch.zeros((B, self.state_size), device=device)
         
-        with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu', 
-                      dtype=torch.bfloat16, 
-                      enabled=AMP_AVAILABLE and device.type == 'cuda'):
-            
-            mlp_features = self.mlp_encoder(obs_flat)
-            pa_emb = self.prev_action_embed(prev_actions_flat)
-            x = torch.cat([mlp_features, pa_emb], dim=-1)
-            x = self.input_proj(x)
-            
-            x = x.view(B, T_max, self.d_model)
-            
-            state_out = {}
-            for i, mamba_block in enumerate(self.mamba_blocks):
-                h_prev = state_in[i]
-                if self.use_checkpoint and self.training:
-                    x, h_last = checkpoint(mamba_block, x, h_prev, use_reentrant=False)
-                else:
-                    x, h_last = mamba_block(x, h_prev)
-                state_out[f"h_{i}"] = h_last.detach()
-            
-            x_core = self.final_norm(x)
-            x_core_flat = x_core.reshape(BT, self.d_model)
-            
+        mlp_features = self.mlp_encoder(obs_flat)
+        pa_emb = self.prev_action_embed(prev_actions_flat)
+        x = torch.cat([mlp_features, pa_emb], dim=-1)
+        x = self.input_proj(x)
+        x = x.view(B, T_max, self.d_model)
+        
+        state_out = {}
+        for i, mamba_block in enumerate(self.mamba_blocks):
+            h_prev = state_in[i]
             if self.use_checkpoint and self.training:
-                policy_logits_flat = checkpoint(self.policy_head, x_core_flat, use_reentrant=False)
+                x, h_last = checkpoint(mamba_block, x, h_prev, use_reentrant=False)
             else:
-                policy_logits_flat = self.policy_head(x_core_flat)
-            
-            value_outputs = torch.zeros((BT, self.value_output_dim), 
-                                        device=device, dtype=x_core_flat.dtype)
-            
-            for stage_idx in range(self.num_stages):
-                stage_mask = (stage_indices_flat == stage_idx)
-                if stage_mask.any():
-                    stage_features = x_core_flat[stage_mask]
-                    if self.use_checkpoint and self.training:
-                        stage_values = checkpoint(self.value_heads[stage_idx], stage_features, use_reentrant=False)
-                    else:
-                        stage_values = self.value_heads[stage_idx](stage_features)
-                    
-                    value_outputs[stage_mask] = stage_values.to(value_outputs.dtype)
-            
-            if "action_mask" in batch:
-                action_mask = batch["action_mask"]
-                if action_mask.dim() == 2:
+                x, h_last = mamba_block(x, h_prev)
+            state_out[f"h_{i}"] = h_last.detach()
+        
+        x_core = self.final_norm(x)
+        x_core_flat = x_core.reshape(BT, self.d_model)
+        
+        if self.use_checkpoint and self.training:
+            policy_logits_flat = checkpoint(self.policy_head, x_core_flat, use_reentrant=False)
+        else:
+            policy_logits_flat = self.policy_head(x_core_flat)
+        
+        value_outputs = torch.zeros((BT, self.value_output_dim), device=device, dtype=x_core_flat.dtype)
+        
+        for stage_idx in range(self.num_stages):
+            stage_mask = (stage_indices_flat == stage_idx)
+            if stage_mask.any():
+                stage_features = x_core_flat[stage_mask]
+                if self.use_checkpoint and self.training:
+                    stage_values = checkpoint(self.value_heads[stage_idx], stage_features, use_reentrant=False)
+                else:
+                    stage_values = self.value_heads[stage_idx](stage_features)
+                value_outputs[stage_mask] = stage_values.to(value_outputs.dtype)
+        
+        if "action_mask" in batch:
+            action_mask = batch["action_mask"]
+            if action_mask.dim() == 2:
+                if action_mask.shape[0] == B and T_max > 1:
                     action_mask = action_mask.unsqueeze(1).expand(-1, T_max, -1)
+            if action_mask.numel() == BT * self.num_actions:
                 action_mask_flat = action_mask.reshape(BT, -1).float()
-                
                 mask_sum = action_mask_flat.sum(dim=1)
                 action_mask_flat[mask_sum == 0] = 1.0
-                
                 inf_mask = torch.log(action_mask_flat.clamp(min=1e-10))
                 policy_logits_flat = policy_logits_flat + inf_mask
-            
-            policy_logits_flat = torch.nan_to_num(policy_logits_flat, nan=0.0, posinf=1e9, neginf=-1e9)
-            
+        
+        policy_logits_flat = torch.nan_to_num(policy_logits_flat, nan=0.0, posinf=1e9, neginf=-1e9)
+        
         if self.use_distributional:
             probs = F.softmax(value_outputs.float(), dim=-1)
             atoms = self.atoms.to(probs.device).view(1, 1, -1)
@@ -374,7 +342,6 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
             policy_logits = policy_logits_flat
             vf_preds = vf_preds_flat
 
-        # WICHTIG: Cast auf float32 für den RLlib Metrics Logger
         policy_logits = policy_logits.float()
         vf_preds = vf_preds.float()
 
@@ -385,13 +352,11 @@ class GFootballMambaRLModule(TorchRLModule, ValueFunctionAPI):
             else:
                 state_out_time_major[key] = tensor
         
-        outputs = {
+        return {
             "action_dist_inputs": policy_logits, 
             "vf_preds": vf_preds,
             **state_out_time_major
         }
-
-        return outputs
 
     @override(TorchRLModule)
     def forward_inference(self, batch: Dict[str, TensorType], **kwargs) -> Dict[str, TensorType]:
