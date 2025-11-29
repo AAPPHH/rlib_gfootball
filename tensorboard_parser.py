@@ -3,16 +3,50 @@ import csv
 from pathlib import Path
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-ROOT_LOGDIR = r"C:\clones\rlib_gfootball\ray_results"
-OUT_CSV = r"C:\clones\rlib_gfootball\curriculum_export.csv"
+ROOT_LOGDIR = r"C:\clones\rlib_gfootball\logs"  # Angepasst auf neuen log_dir
+OUT_CSV = r"C:\clones\rlib_gfootball\training_export.csv"
 
+# Angepasst auf das neue Logging-Format
 FILTER_TAGS = [
-    "stage_0", "stage_1", "stage_2", "stage_3",
-    "stage_4", "stage_5", "stage_6", "stage_7",
-    "curriculum/",
-    "pbt_metric",
-    "episode_return_mean",
-    "episode_len_mean",
+    # Loss metrics
+    "loss/total",
+    "loss/policy",
+    "loss/value",
+    "loss/entropy",
+    
+    # PPO metrics
+    "ppo/clip_fraction",
+    "ppo/approx_kl",
+    "ppo/explained_variance",
+    
+    # Training metrics
+    "train/lr",
+    "train/grad_norm",
+    "train/nan_count",
+    
+    # Episode metrics (global)
+    "episode/return_mean",
+    "episode/return_std",
+    "episode/return_min",
+    "episode/return_max",
+    "episode/win_rate",
+    "episode/length_mean",
+    
+    # Episode metrics (per stage)
+    "episode/return_stage_",
+    "episode/win_rate_stage_",
+    "episode/length_stage_",
+    
+    # Curriculum metrics
+    "curriculum/ema_return_stage_",
+    "curriculum/ema_win_stage_",
+    "curriculum/normalized_return_stage_",
+    "curriculum/episodes_stage_",
+    
+    # Throughput
+    "throughput/steps_per_second",
+    "throughput/episodes",
+    "throughput/updates",
 ]
 
 def iter_event_dirs(root: Path):
@@ -47,7 +81,8 @@ def main():
             
             try:
                 ea.Reload()
-            except Exception:
+            except Exception as e:
+                print(f"Fehler beim Laden von {log_dir}: {e}")
                 continue
 
             for tag in ea.Tags().get('scalars', []):
