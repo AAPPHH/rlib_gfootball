@@ -120,23 +120,25 @@ class GFootballPolicyValueNet(nn.Module):
         policy_layers.append(nn.Linear(in_dim, config.num_actions))
         self.policy_head = nn.Sequential(*policy_layers)
         
-        value_layers = []
-        in_dim = self.lstm.output_dim
-        for hidden_dim in config.value_hidden:
-            value_layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU()])
-            in_dim = hidden_dim
-            
+        # Multi-Head Value (MHV) like WeKick - vectorized for efficiency
+        self.num_value_heads = 5
+        value_hidden = config.value_hidden[0] if config.value_hidden else 256
+        
+        # Shared first layer, then parallel heads
+        self.value_fc1 = nn.Linear(self.lstm.output_dim, value_hidden * self.num_value_heads)
+        
         if config.use_distributional:
-            value_layers.append(nn.Linear(in_dim, config.num_atoms))
+            self.value_fc2 = nn.Linear(value_hidden * self.num_value_heads, config.num_atoms * self.num_value_heads)
             self.register_buffer(
                 'value_support',
                 torch.linspace(config.v_min, config.v_max, config.num_atoms)
             )
+            self.value_out_dim = config.num_atoms
         else:
-            value_layers.append(nn.Linear(in_dim, 1))
+            self.value_fc2 = nn.Linear(value_hidden * self.num_value_heads, self.num_value_heads)
             self.value_support = None
+            self.value_out_dim = 1
             
-        self.value_head = nn.Sequential(*value_layers)
         self._init_weights()
         
     def _init_weights(self):
@@ -160,7 +162,8 @@ class GFootballPolicyValueNet(nn.Module):
                         param.data[n//4:n//2].fill_(1.0)
                 
         nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.01)
-        nn.init.orthogonal_(self.value_head[-1].weight, gain=1.0)
+        nn.init.orthogonal_(self.value_fc1.weight, gain=math.sqrt(2))
+        nn.init.orthogonal_(self.value_fc2.weight, gain=1.0)
     
     def _normalize_obs(self, obs: torch.Tensor) -> Tuple[torch.Tensor, bool]:
         if obs.dim() == 1:
@@ -220,12 +223,21 @@ class GFootballPolicyValueNet(nn.Module):
         
         logits = self.policy_head(x)
         
+        # Multi-Head Value - vectorized
+        # x: [B, L, lstm_hidden]
+        v = F.relu(self.value_fc1(x))  # [B, L, hidden * num_heads]
+        v = self.value_fc2(v)  # [B, L, out_dim * num_heads]
+        
+        # Reshape to separate heads
+        B_size, L_size = v.shape[:2]
+        v = v.view(B_size, L_size, self.num_value_heads, self.value_out_dim)  # [B, L, num_heads, out_dim]
+        
         if self.config.use_distributional:
-            value_logits = self.value_head(x)
+            value_logits = v.mean(dim=2)  # [B, L, num_atoms] - average over heads
             value_probs = F.softmax(value_logits, dim=-1)
             value = (value_probs * self.value_support).sum(-1, keepdim=True)
         else:
-            value = self.value_head(x)
+            value = v.mean(dim=2)  # [B, L, 1] - average over heads
             value_logits = None
             
         log_probs = F.log_softmax(logits, dim=-1)
@@ -357,13 +369,15 @@ class TrainingConfig:
 def get_default_stages() -> List[StageConfig]:
     return [
         StageConfig(0, "academy_empty_goal_close", "simple115v2", 1, 0, 400),
-        StageConfig(1, "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 400),
-        StageConfig(2, "academy_pass_and_shoot_with_keeper", "simple115v2", 2, 0, 400),
-        StageConfig(3, "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 400),
-        StageConfig(4, "academy_single_goal_versus_lazy", "simple115v2", 3, 0, 1000),
-        StageConfig(5, "11_vs_11_easy_stochastic", "simple115v2", 3, 0, 3000),
-        StageConfig(6, "11_vs_11_easy_stochastic", "simple115v2", 5, 0, 3000),
-        StageConfig(7, "11_vs_11_stochastic", "simple115v2", 11, 0, 3000),
+        StageConfig(1, "academy_empty_goal", "simple115v2", 1, 0, 400),
+        StageConfig(2, "academy_run_to_score", "simple115v2", 1, 0, 400),
+        StageConfig(3, "academy_run_to_score_with_keeper", "simple115v2", 1, 0, 400),
+        StageConfig(4, "academy_pass_and_shoot_with_keeper", "simple115v2", 2, 0, 400),
+        StageConfig(5, "academy_3_vs_1_with_keeper", "simple115v2", 3, 0, 400),
+        StageConfig(6, "academy_counterattack_easy", "simple115v2", 4, 0, 600),
+        StageConfig(7, "academy_counterattack_hard", "simple115v2", 4, 0, 600),
+        StageConfig(8, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000),
+        StageConfig(9, "11_vs_11_easy_stochastic", "simple115v2", 11, 0, 3000),
     ]
 
 @dataclass
@@ -1716,7 +1730,7 @@ def main():
         'value_hidden': [256],
         'use_distributional': True,
         'dropout': 0.0,
-        'num_stages': len(get_default_stages()),
+        'num_stages': 10,
     }
     
     config = TrainingConfig(
@@ -1725,8 +1739,8 @@ def main():
         max_steps_without_progress=100_000_000,
         num_workers=NUM_WORKERS,
         trajectory_length=128,
-        batch_size=2048,
-        minibatch_size=512,
+        batch_size=4096,
+        minibatch_size=1024,
         num_epochs=3,
         learning_rate=1e-4,  # WeKick: 1e-4
         lr_schedule="cosine_restarts",
@@ -1763,3 +1777,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 

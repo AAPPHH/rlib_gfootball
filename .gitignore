@@ -16,6 +16,7 @@
 /cold_start/ducklake/
 /cold_start/xgboost_tuned/
 /logs*/
+/checkpoints*/
 
 *.err
 *.out
