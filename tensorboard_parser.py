@@ -3,51 +3,20 @@ import csv
 from pathlib import Path
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-ROOT_LOGDIR = r"C:\clones\rlib_gfootball\logs"  # Angepasst auf neuen log_dir
-OUT_CSV = r"C:\clones\rlib_gfootball\training_export.csv"
+ROOT_LOGDIR = r"C:\clones\rlib_gfootball\logs"
+OUT_CSV = r"C:\clones\rlib_gfootball\training_compact.csv"
 
-# Angepasst auf das neue Logging-Format
+# Nur die wichtigsten Metriken - stark reduziert
 FILTER_TAGS = [
-    # Loss metrics
     "loss/total",
-    "loss/policy",
-    "loss/value",
-    "loss/entropy",
-    
-    # PPO metrics
-    "ppo/clip_fraction",
-    "ppo/approx_kl",
-    "ppo/explained_variance",
-    
-    # Training metrics
-    "train/lr",
-    "train/grad_norm",
-    "train/nan_count",
-    
-    # Episode metrics (global)
-    "episode/return_mean",
-    "episode/return_std",
-    "episode/return_min",
-    "episode/return_max",
     "episode/win_rate",
-    "episode/length_mean",
-    
-    # Episode metrics (per stage)
-    "episode/return_stage_",
-    "episode/win_rate_stage_",
-    "episode/length_stage_",
-    
-    # Curriculum metrics
-    "curriculum/ema_return_stage_",
     "curriculum/ema_win_stage_",
-    "curriculum/normalized_return_stage_",
-    "curriculum/episodes_stage_",
-    
-    # Throughput
-    "throughput/steps_per_second",
-    "throughput/episodes",
-    "throughput/updates",
+    "curriculum/sample_prob_stage_",
+    "curriculum/num_learned",
 ]
+
+# Nur jeden N-ten Datenpunkt (z.B. alle 10)
+DOWNSAMPLE = 10
 
 def iter_event_dirs(root: Path):
     for p in root.rglob("*"):
@@ -89,9 +58,11 @@ def main():
                 if not any(ft in tag for ft in FILTER_TAGS):
                     continue
                 try:
-                    for e in ea.Scalars(tag):
-                        w.writerow([run_name, tag, e.step, e.value])
-                        rows += 1
+                    scalars = ea.Scalars(tag)
+                    for i, e in enumerate(scalars):
+                        if i % DOWNSAMPLE == 0:  # Nur jeden N-ten Punkt
+                            w.writerow([run_name, tag, e.step, round(e.value, 4)])
+                            rows += 1
                 except KeyError:
                     continue
 

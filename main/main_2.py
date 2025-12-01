@@ -17,10 +17,9 @@ import gfootball.env as football_env
 @dataclass
 class ModelConfig:
     obs_dim: int = 460
-    d_model: int = 64
-    mamba_state: int = 8
-    num_mamba_layers: int = 4
-    mamba_expand: int = 2
+    d_model: int = 256  # WeKick: 256
+    lstm_hidden: int = 256  # WeKick: 256
+    lstm_layers: int = 1
     num_actions: int = 19
     action_emb_dim: int = 16
     encoder_hidden: List[int] = None
@@ -36,154 +35,54 @@ class ModelConfig:
     
     def __post_init__(self):
         if self.encoder_hidden is None:
-            self.encoder_hidden = [256, 128]
+            self.encoder_hidden = [256, 256]  # WeKick: 256 dim
         if self.policy_hidden is None:
-            self.policy_hidden = [128, 64]
+            self.policy_hidden = [256]
         if self.value_hidden is None:
-            self.value_hidden = [128, 64]
+            self.value_hidden = [256]
 
-class MambaBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_inner = d_model * expand
-        self.dt_rank = max(1, d_model // 16)
-        
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        
-        self.conv1d = nn.Conv1d(
-            self.d_inner, self.d_inner, 
-            kernel_size=4, padding=3, 
-            groups=self.d_inner, bias=True
-        )
-        
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        
-        dt_init_std = self.dt_rank ** -0.5
-        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        
-        dt_min, dt_max = 0.001, 0.1
-        inv_dt = torch.exp(
-            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        )
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt.log().clamp(min=-4.0, max=2.0))
-        
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A).clamp(min=-5.0, max=2.0))
-        
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-        nn.init.orthogonal_(self.out_proj.weight, gain=0.5)
-        
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        
-    def forward(self, x: torch.Tensor, h: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if x.dim() != 3:
-            raise ValueError(f"MambaBlock expects 3D input (B,L,D), got {x.dim()}D")
-            
-        B, L, D = x.shape
-        
-        xz = self.in_proj(x)
-        x_in, z = xz.chunk(2, dim=-1)
-        
-        x_in = x_in.transpose(1, 2)
-        x_in = self.conv1d(x_in)[:, :, :L]
-        x_in = x_in.transpose(1, 2)
-        x_in = F.silu(x_in)
-        
-        x_dbl = self.x_proj(x_in)
-        dt, B_param, C_param = torch.split(
-            x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1
-        )
-        
-        dt = self.dt_proj(dt)
-        dt = F.softplus(dt).clamp(min=1e-4, max=10.0)
-        
-        A = -torch.exp(self.A_log.float().clamp(min=-5.0, max=2.0))
-        
-        y, h_new = self._selective_scan(x_in, dt, A, B_param, C_param, h)
-        
-        y = y * F.silu(z)
-        y = self.out_proj(y)
-        y = self.dropout(y)
-        
-        return y, h_new
+
+class LSTMEncoder(nn.Module):
+    """LSTM encoder like WeKick (32 steps, 256 hidden)."""
     
-    def _selective_scan(
-        self, 
-        x: torch.Tensor,
-        dt: torch.Tensor,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        C: torch.Tensor,
-        h: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
-        B_size, L, d_inner = x.shape
-        d_state = self.d_state
-        
-        if h is None:
-            h = torch.zeros(B_size, d_inner, d_state, device=x.device, dtype=x.dtype)
-        
-        dA = torch.exp(
-            (dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)).clamp(min=-20.0, max=0.0)
-        )
-        dB = dt.unsqueeze(-1) * B.unsqueeze(2)
-        
-        outputs = []
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x[:, t:t+1, :].transpose(1, 2)
-            h = h.clamp(min=-50.0, max=50.0)
-            C_t = C[:, t, :].unsqueeze(1)
-            y_t = (h * C_t).sum(-1)
-            outputs.append(y_t)
-            
-        y = torch.stack(outputs, dim=1)
-        y = y + x * self.D.unsqueeze(0).unsqueeze(0)
-        
-        return y, h
-
-class MambaEncoder(nn.Module):
-    def __init__(
-        self, 
-        d_model: int, 
-        d_state: int, 
-        num_layers: int, 
-        expand: int = 2, 
-        dropout: float = 0.0
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int = 256, num_layers: int = 1, dropout: float = 0.0):
         super().__init__()
-        self.layers = nn.ModuleList([
-            MambaBlock(d_model, d_state, expand, dropout=dropout) 
-            for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(d_model)
+        self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.d_state = d_state
-        self.d_inner = d_model * expand
+        
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.output_dim = hidden_dim
         
     def forward(
         self, 
         x: torch.Tensor, 
-        hidden_states: Optional[List[torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # x: (B, L, D)
+        B, L, D = x.shape
         
-        if hidden_states is None:
-            hidden_states = [None] * self.num_layers
-            
-        new_hidden_states = []
-        for i, layer in enumerate(self.layers):
-            residual = x
-            x, h_new = layer(x, hidden_states[i])
-            x = residual + x
-            new_hidden_states.append(h_new)
-            
-        x = self.norm(x)
-        return x, new_hidden_states
+        if hidden_state is None:
+            h0 = torch.zeros(self.num_layers, B, self.hidden_dim, device=x.device, dtype=x.dtype)
+            c0 = torch.zeros(self.num_layers, B, self.hidden_dim, device=x.device, dtype=x.dtype)
+            hidden_state = (h0, c0)
+        
+        output, (hn, cn) = self.lstm(x, hidden_state)
+        output = self.layer_norm(output)
+        
+        return output, (hn, cn)
+    
+    def get_initial_hidden_state(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=device)
+        return (h0, c0)
 
 class GFootballPolicyValueNet(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -200,32 +99,31 @@ class GFootballPolicyValueNet(nn.Module):
             encoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.SiLU()
+                nn.ReLU()  # WeKick style
             ])
             in_dim = hidden_dim
-        encoder_layers.append(nn.Linear(in_dim, config.d_model))
         self.obs_encoder = nn.Sequential(*encoder_layers)
         
-        self.mamba = MambaEncoder(
-            d_model=config.d_model,
-            d_state=config.mamba_state,
-            num_layers=config.num_mamba_layers,
-            expand=config.mamba_expand,
+        # LSTM like WeKick
+        self.lstm = LSTMEncoder(
+            input_dim=in_dim,
+            hidden_dim=config.lstm_hidden,
+            num_layers=config.lstm_layers,
             dropout=config.dropout
         )
         
         policy_layers = []
-        in_dim = config.d_model
+        in_dim = self.lstm.output_dim
         for hidden_dim in config.policy_hidden:
-            policy_layers.extend([nn.Linear(in_dim, hidden_dim), nn.SiLU()])
+            policy_layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU()])
             in_dim = hidden_dim
         policy_layers.append(nn.Linear(in_dim, config.num_actions))
         self.policy_head = nn.Sequential(*policy_layers)
         
         value_layers = []
-        in_dim = config.d_model
+        in_dim = self.lstm.output_dim
         for hidden_dim in config.value_hidden:
-            value_layers.extend([nn.Linear(in_dim, hidden_dim), nn.SiLU()])
+            value_layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU()])
             in_dim = hidden_dim
             
         if config.use_distributional:
@@ -249,6 +147,17 @@ class GFootballPolicyValueNet(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
+            elif isinstance(module, nn.LSTM):
+                for name, param in module.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+                        # Set forget gate bias to 1 for better gradient flow
+                        n = param.size(0)
+                        param.data[n//4:n//2].fill_(1.0)
                 
         nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.value_head[-1].weight, gain=1.0)
@@ -290,7 +199,7 @@ class GFootballPolicyValueNet(nn.Module):
         obs: torch.Tensor, 
         stage_idx: torch.Tensor, 
         prev_action: Optional[torch.Tensor] = None, 
-        hidden_state: Optional[List[torch.Tensor]] = None, 
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
         return_hidden: bool = False
     ) -> Dict[str, torch.Tensor]:
         
@@ -307,7 +216,7 @@ class GFootballPolicyValueNet(nn.Module):
         x = torch.cat([obs, stage_emb, action_emb], dim=-1)
         x = self.obs_encoder(x)
         
-        x, new_hidden = self.mamba(x, hidden_state)
+        x, new_hidden = self.lstm(x, hidden_state)
         
         logits = self.policy_head(x)
         
@@ -346,13 +255,16 @@ class GFootballPolicyValueNet(nn.Module):
         obs: torch.Tensor, 
         stage_idx: torch.Tensor, 
         prev_action: Optional[torch.Tensor] = None, 
-        hidden_state: Optional[List[torch.Tensor]] = None, 
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
         deterministic: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[List[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         
         output = self.forward(obs, stage_idx, prev_action, hidden_state, return_hidden=True)
         logits = output['logits']
         
+        # NaN protection
+        if torch.isnan(logits).any():
+            logits = torch.zeros_like(logits)
         logits = logits.clamp(min=-20.0, max=20.0)
         
         dist = Categorical(logits=logits)
@@ -371,7 +283,7 @@ class GFootballPolicyValueNet(nn.Module):
         stage_idx: torch.Tensor, 
         actions: torch.Tensor, 
         prev_action: Optional[torch.Tensor] = None, 
-        hidden_state: Optional[List[torch.Tensor]] = None
+        hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
         output = self.forward(obs, stage_idx, prev_action, hidden_state)
@@ -384,12 +296,8 @@ class GFootballPolicyValueNet(nn.Module):
         entropy = dist.entropy()
         return log_prob, entropy, output['value']
     
-    def get_initial_hidden_state(self, batch_size: int, device: torch.device) -> List[torch.Tensor]:
-        d_inner = self.config.d_model * self.config.mamba_expand
-        return [
-            torch.zeros(batch_size, d_inner, self.config.mamba_state, device=device) 
-            for _ in range(self.config.num_mamba_layers)
-        ]
+    def get_initial_hidden_state(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.lstm.get_initial_hidden_state(batch_size, device)
 
 def create_model(config_dict: Optional[Dict] = None) -> GFootballPolicyValueNet:
     if config_dict is None:
@@ -412,12 +320,8 @@ class StageConfig:
 @dataclass 
 class TrainingConfig:
     stages: List[StageConfig] = field(default_factory=list)
-    # Curriculum settings - reward-based progression
-    stage_unlock_win_rate: float = 0.7  # Win rate required to unlock next stage
-    stage_unlock_min_episodes: int = 100  # Minimum episodes before unlock check
-    stage_mastery_win_rate: float = 0.9  # Win rate to consider stage "mastered"
-    final_stage_target_win_rate: float = 0.5  # Target for final stage to end training
-    max_steps_without_progress: int = 500_000  # Stop if no progress for this many steps
+    final_stage_target_win_rate: float = 0.5
+    max_steps_without_progress: int = 500_000
     num_workers: int = 20
     envs_per_worker: int = 1
     trajectory_length: int = 128
@@ -426,17 +330,18 @@ class TrainingConfig:
     minibatch_size: int = 512
     num_epochs: int = 4
     learning_rate: float = 3e-4
-    lr_schedule: str = "cosine_restarts"  # Better for long training
+    lr_schedule: str = "cosine_restarts"
     max_grad_norm: float = 0.5
     gamma: float = 0.998
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     entropy_coeff: float = 0.01
     value_coeff: float = 0.5
+    si_lambda: float = 0.1
     use_vtrace: bool = False
     vtrace_rho_max: float = 1.0
     vtrace_c_max: float = 1.0
-    total_steps: int = 100_000_000  # High limit, will stop based on curriculum
+    total_steps: int = 100_000_000
     log_interval: int = 10
     eval_interval: int = 50
     checkpoint_interval: int = 100
@@ -612,20 +517,20 @@ class BaselineCalibrator:
 
 @ray.remote
 class CurriculumController:
-    """
-    Reward-based curriculum controller.
-    - Stages unlock when win_rate >= unlock_threshold
-    - Training ends when final stage reaches target win_rate
-    - Focuses training on stages that need improvement
-    """
+    T_LEARN = 0.65
+    T_UNLOCK = 0.70
+    T_MASTERY = 0.90
+    MIN_EPS_UNLOCK = 100
+    LP_WINDOW = 200
+    STALENESS_COEFF = 0.1
+    MIN_WEIGHT = 0.05
+    
     def __init__(
         self, 
         stages: List[Dict], 
         baselines: Dict[int, Dict],
-        unlock_win_rate: float = 0.7,
-        unlock_min_episodes: int = 100,
-        mastery_win_rate: float = 0.9,
         final_target_win_rate: float = 0.5,
+        initial_state: Optional[Dict] = None,
     ):
         self.stages = [StageConfig(**s) if isinstance(s, dict) else s for s in stages]
         self.baselines = {
@@ -633,177 +538,271 @@ class CurriculumController:
             for k, v in baselines.items()
         }
         self.num_stages = len(self.stages)
-        
-        # Unlock thresholds
-        self.unlock_win_rate = unlock_win_rate
-        self.unlock_min_episodes = unlock_min_episodes
-        self.mastery_win_rate = mastery_win_rate
         self.final_target_win_rate = final_target_win_rate
         
-        # State
+        if initial_state:
+            self._restore_state(initial_state)
+        else:
+            self._init_fresh()
+    
+    def _init_fresh(self):
         self.episode_count = 0
-        self.unlocked_stages = {0}  # Start with only stage 0 unlocked
+        self.unlocked_stages = {0}
+        self.learned_stages = set()
         self.mastered_stages = set()
-        self.highest_unlocked = 0
-        self.last_unlock_episode = 0
-        
         self.stage_stats = {
             s.stage_id: {
-                'returns': [], 
-                'wins': [], 
-                'episodes': 0, 
-                'ema_return': 0.0, 
+                'episodes': 0,
+                'ema_return': 0.0,
                 'ema_win': 0.0,
-                'recent_wins': [],  # Last N wins for unlock check
+                'ema_win_slow': 0.0,
+                'peak_win': 0.0,
+                'recent_wins': [],
+                'last_sampled': 0,
+                'lp_history': [],
             } 
             for s in self.stages
         }
+    
+    def _restore_state(self, state: Dict):
+        self.episode_count = state.get('episode_count', 0)
+        self.unlocked_stages = set(state.get('unlocked_stages', [0]))
+        self.learned_stages = set(state.get('learned_stages', []))
+        self.mastered_stages = set(state.get('mastered_stages', []))
         
+        saved_stats = state.get('stage_stats', {})
+        self.stage_stats = {}
+        for s in self.stages:
+            sid_str = str(s.stage_id)
+            if sid_str in saved_stats:
+                ss = saved_stats[sid_str]
+                self.stage_stats[s.stage_id] = {
+                    'episodes': ss.get('episodes', 0),
+                    'ema_return': ss.get('ema_return', 0.0),
+                    'ema_win': ss.get('ema_win', 0.0),
+                    'ema_win_slow': ss.get('ema_win_slow', ss.get('ema_win', 0.0)),
+                    'peak_win': ss.get('peak_win', 0.0),
+                    'recent_wins': [],
+                    'last_sampled': ss.get('last_sampled', 0),
+                    'lp_history': [],
+                }
+            else:
+                self.stage_stats[s.stage_id] = {
+                    'episodes': 0, 'ema_return': 0.0, 'ema_win': 0.0,
+                    'ema_win_slow': 0.0, 'peak_win': 0.0, 'recent_wins': [],
+                    'last_sampled': 0, 'lp_history': [],
+                }
+        
+        print(f"  Restored: ep={self.episode_count}, learned={sorted(self.learned_stages)}, mastered={sorted(self.mastered_stages)}")
+    
+    def _compute_learning_progress(self, sid: int) -> float:
+        stats = self.stage_stats[sid]
+        lp = stats['ema_win'] - stats['ema_win_slow']
+        return lp
+    
+    def _compute_staleness(self, sid: int) -> float:
+        stats = self.stage_stats[sid]
+        if stats['episodes'] == 0:
+            return 0.0
+        episodes_since = self.episode_count - stats['last_sampled']
+        return min(episodes_since / 500.0, 2.0)
+    
+    def _compute_weight(self, sid: int) -> float:
+        stats = self.stage_stats[sid]
+        
+        if stats['episodes'] < 50:
+            base = 1.0
+        else:
+            lp = self._compute_learning_progress(sid)
+            lp_score = max(0.0, lp) * 10.0
+            
+            forgetting = max(0.0, stats['peak_win'] - stats['ema_win'])
+            forgetting_score = forgetting * 5.0
+            
+            if sid in self.mastered_stages:
+                base = 0.1 + forgetting_score
+            elif sid in self.learned_stages:
+                base = 0.3 + lp_score + forgetting_score
+            else:
+                if stats['ema_win'] < 0.1:
+                    base = 0.5 + lp_score
+                elif stats['ema_win'] < 0.3:
+                    base = 0.8 + lp_score
+                else:
+                    base = 1.0 + lp_score
+        
+        staleness = self._compute_staleness(sid)
+        staleness_bonus = self.STALENESS_COEFF * staleness
+        
+        return max(self.MIN_WEIGHT, base + staleness_bonus)
+    
     def get_stage(self) -> Dict:
-        """Select a stage to train on, prioritizing stages that need work."""
         available = sorted(self.unlocked_stages)
         
         if len(available) == 1:
+            self.stage_stats[available[0]]['last_sampled'] = self.episode_count
             return asdict(self.stages[available[0]])
         
-        # Calculate weights: prioritize stages with lower win rates
-        weights = []
+        weights = {}
         for sid in available:
-            stats = self.stage_stats[sid]
-            
-            if sid in self.mastered_stages:
-                # Mastered stages get low weight but still sampled occasionally
-                w = 0.1
-            elif stats['episodes'] < 20:
-                # Not enough data, high priority to explore
-                w = 3.0
-            else:
-                # Weight inversely proportional to win rate
-                win_rate = stats['ema_win']
-                if win_rate >= self.mastery_win_rate:
-                    w = 0.2
-                elif win_rate >= self.unlock_win_rate:
-                    w = 0.5
-                else:
-                    # Focus on stages below unlock threshold
-                    w = 2.0 - win_rate
-                    
-            # Boost weight for highest unlocked stage (frontier)
-            if sid == self.highest_unlocked and sid not in self.mastered_stages:
-                w *= 1.5
-                
-            weights.append(max(0.05, w))
+            weights[sid] = self._compute_weight(sid)
         
-        weights = np.array(weights)
-        weights /= weights.sum()
+        total = sum(weights.values())
+        probs = {k: v/total for k, v in weights.items()}
         
-        chosen_idx = np.random.choice(len(available), p=weights)
-        return asdict(self.stages[available[chosen_idx]])
+        stages_list = list(probs.keys())
+        prob_values = [probs[s] for s in stages_list]
+        chosen = np.random.choice(stages_list, p=prob_values)
+        
+        self.stage_stats[chosen]['last_sampled'] = self.episode_count
+        
+        return asdict(self.stages[chosen])
     
     def report_episode(self, stage_id: int, episode_return: float, won: bool):
-        """Report episode result and check for stage unlocks."""
         self.episode_count += 1
         stats = self.stage_stats[stage_id]
         
-        # Update stats
-        stats['returns'].append(episode_return)
-        stats['wins'].append(1.0 if won else 0.0)
         stats['episodes'] += 1
         
-        # Track recent wins (last 100 episodes)
         stats['recent_wins'].append(1.0 if won else 0.0)
         if len(stats['recent_wins']) > 100:
             stats['recent_wins'].pop(0)
         
-        # EMA update
-        alpha = 0.02  # Slower EMA for more stable estimates
+        alpha_fast = 0.02
+        alpha_slow = 0.005
+        
         if stats['episodes'] == 1:
             stats['ema_return'] = episode_return
             stats['ema_win'] = float(won)
+            stats['ema_win_slow'] = float(won)
         else:
-            stats['ema_return'] = (1 - alpha) * stats['ema_return'] + alpha * episode_return
-            stats['ema_win'] = (1 - alpha) * stats['ema_win'] + alpha * float(won)
+            stats['ema_return'] = (1 - alpha_fast) * stats['ema_return'] + alpha_fast * episode_return
+            stats['ema_win'] = (1 - alpha_fast) * stats['ema_win'] + alpha_fast * float(won)
+            stats['ema_win_slow'] = (1 - alpha_slow) * stats['ema_win_slow'] + alpha_slow * float(won)
         
-        # Check for mastery
-        if stats['episodes'] >= self.unlock_min_episodes:
-            recent_win_rate = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
-            if recent_win_rate >= self.mastery_win_rate:
-                self.mastered_stages.add(stage_id)
+        if stats['ema_win'] > stats['peak_win']:
+            stats['peak_win'] = stats['ema_win']
         
-        # Check for unlock of next stage
+        lp = self._compute_learning_progress(stage_id)
+        stats['lp_history'].append(lp)
+        if len(stats['lp_history']) > self.LP_WINDOW:
+            stats['lp_history'].pop(0)
+        
+        self._check_learned(stage_id)
         self._check_unlock(stage_id)
-        
-    def _check_unlock(self, stage_id: int):
-        """Check if completing this stage should unlock the next one."""
-        next_stage = stage_id + 1
-        
-        # Already unlocked or no more stages
-        if next_stage in self.unlocked_stages or next_stage >= self.num_stages:
+        self._check_mastery(stage_id)
+    
+    def _check_learned(self, stage_id: int):
+        if stage_id in self.learned_stages:
             return
-            
+        
         stats = self.stage_stats[stage_id]
         
-        # Need minimum episodes
-        if stats['episodes'] < self.unlock_min_episodes:
+        if stats['episodes'] < 100:
             return
-            
-        # Check recent win rate (more reliable than EMA for unlocking)
-        recent_win_rate = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
         
-        if recent_win_rate >= self.unlock_win_rate:
+        if stats['ema_win'] < self.T_LEARN:
+            return
+        
+        recent_wr = np.mean(stats['recent_wins']) if len(stats['recent_wins']) >= 50 else 0
+        if recent_wr < 0.5:
+            return
+        
+        self.learned_stages.add(stage_id)
+        print(f"\n📚 STAGE {stage_id} LEARNED! (ema={stats['ema_win']:.1%})\n")
+    
+    def _check_unlock(self, stage_id: int):
+        next_stage = stage_id + 1
+        
+        if next_stage >= self.num_stages:
+            return
+        if next_stage in self.unlocked_stages:
+            return
+        
+        stats = self.stage_stats[stage_id]
+        
+        if stats['episodes'] < self.MIN_EPS_UNLOCK:
+            return
+        
+        recent_wr = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
+        
+        if recent_wr >= self.T_UNLOCK:
             self.unlocked_stages.add(next_stage)
-            self.highest_unlocked = max(self.highest_unlocked, next_stage)
-            self.last_unlock_episode = self.episode_count
-            print(f"\n🔓 STAGE {next_stage} UNLOCKED! (Stage {stage_id} win rate: {recent_win_rate:.1%})\n")
-            
+            print(f"\n🔓 STAGE {next_stage} UNLOCKED! (Stage {stage_id}: {recent_wr:.1%})\n")
+    
+    def _check_mastery(self, stage_id: int):
+        if stage_id in self.mastered_stages:
+            return
+        
+        stats = self.stage_stats[stage_id]
+        
+        if stats['episodes'] < 200:
+            return
+        
+        recent_wr = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
+        
+        if recent_wr >= self.T_MASTERY:
+            self.mastered_stages.add(stage_id)
+            print(f"\n⭐ STAGE {stage_id} MASTERED! ({recent_wr:.1%})\n")
+    
     def is_training_complete(self) -> bool:
-        """Check if training should end."""
         final_stage = self.num_stages - 1
         
-        # Final stage must be unlocked
-        if final_stage not in self.unlocked_stages:
+        if final_stage not in self.learned_stages:
             return False
-            
-        stats = self.stage_stats[final_stage]
         
-        # Need minimum episodes on final stage
-        if stats['episodes'] < self.unlock_min_episodes:
-            return False
-            
-        # Check if final stage target reached
-        recent_win_rate = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
-        return recent_win_rate >= self.final_target_win_rate
+        stats = self.stage_stats[final_stage]
+        recent_wr = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
+        
+        return recent_wr >= self.final_target_win_rate
     
     def get_progress_summary(self) -> str:
-        """Get a summary string of curriculum progress."""
         lines = []
-        for sid in range(self.num_stages):
+        for sid in sorted(self.unlocked_stages):
             stats = self.stage_stats[sid]
-            status = "🔒"
+            
             if sid in self.mastered_stages:
                 status = "⭐"
-            elif sid in self.unlocked_stages:
+            elif sid in self.learned_stages:
+                status = "📚"
+            else:
                 status = "🔓"
-                
+            
             if stats['episodes'] > 0:
                 recent_wr = np.mean(stats['recent_wins']) if stats['recent_wins'] else 0
-                lines.append(f"{status} S{sid}: {recent_wr:.0%} ({stats['episodes']} eps)")
+                lp = self._compute_learning_progress(sid)
+                weight = self._compute_weight(sid)
+                lp_str = f"LP{lp:+.0%}" if abs(lp) > 0.01 else ""
+                lines.append(f"{status}S{sid}:{recent_wr:.0%} w={weight:.1f} {lp_str}")
             else:
-                lines.append(f"{status} S{sid}: --")
+                lines.append(f"{status}S{sid}:--")
+        
         return " | ".join(lines)
-            
+    
     def get_stats(self) -> Dict:
+        weights = {sid: self._compute_weight(sid) for sid in self.unlocked_stages}
+        total_w = sum(weights.values())
+        sample_probs = {sid: w/total_w for sid, w in weights.items()}
+        
         return {
             'episode_count': self.episode_count,
             'unlocked_stages': list(self.unlocked_stages),
+            'learned_stages': list(self.learned_stages),
             'mastered_stages': list(self.mastered_stages),
-            'highest_unlocked': self.highest_unlocked,
+            'highest_unlocked': max(self.unlocked_stages) if self.unlocked_stages else 0,
             'training_complete': self.is_training_complete(),
+            'sample_probs': sample_probs,
             'stage_stats': {
-                sid: {
+                str(sid): {
                     'episodes': s['episodes'],
                     'ema_return': s['ema_return'],
                     'ema_win': s['ema_win'],
+                    'ema_win_slow': s['ema_win_slow'],
+                    'peak_win': s['peak_win'],
+                    'learning_progress': self._compute_learning_progress(sid),
+                    'forgetting': max(0.0, s['peak_win'] - s['ema_win']),
+                    'staleness': self._compute_staleness(sid),
+                    'weight': self._compute_weight(sid),
                     'recent_win_rate': np.mean(s['recent_wins']) if s['recent_wins'] else 0,
                     'normalized_return': self.baselines[sid].normalize_return(s['ema_return'])
                 } 
@@ -1034,7 +1033,19 @@ class Learner:
         self.nan_count = 0
         self.stats = defaultdict(list)
         
-        print(f"Learner on {self.device}, params: {count_parameters(self.model):,}")
+        self.si_omega = {}
+        self.si_prev_params = {}
+        self.si_running_sum = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.si_omega[name] = torch.zeros_like(param, device=self.device)
+                self.si_prev_params[name] = param.data.clone()
+                self.si_running_sum[name] = torch.zeros_like(param, device=self.device)
+        
+        self.si_lambda = config.si_lambda
+        self.si_epsilon = 1e-3
+        
+        print(f"Learner on {self.device}, params: {count_parameters(self.model):,}, SI lambda: {self.si_lambda}")
         
     def get_weights(self) -> Dict[str, np.ndarray]:
         return {k: v.cpu().numpy() for k, v in self.model.state_dict().items()}
@@ -1114,6 +1125,13 @@ class Learner:
                     self.config.entropy_coeff * entropy_loss
                 )
                 
+                si_loss = 0.0
+                if self.si_lambda > 0:
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and name in self.si_omega:
+                            si_loss += (self.si_omega[name] * (param - self.si_prev_params[name]).pow(2)).sum()
+                    loss = loss + self.si_lambda * si_loss
+                
                 if torch.isnan(loss) or torch.isinf(loss):
                     self.nan_count += 1
                     skipped_minibatches += 1
@@ -1134,6 +1152,12 @@ class Learner:
                     continue
                     
                 self.optimizer.step()
+                
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and name in self.si_running_sum:
+                        delta = param.data - self.si_prev_params[name]
+                        if param.grad is not None:
+                            self.si_running_sum[name] += -param.grad.data * delta
                 
                 total_loss += loss.item()
                 policy_loss_sum += policy_loss.item()
@@ -1158,6 +1182,9 @@ class Learner:
         self._update_lr()
         self.update_count += 1
         
+        if self.update_count % 100 == 0:
+            self._consolidate_si()
+        
         if num_updates == 0:
             return {'nan_skipped': float(skipped_minibatches)}
         
@@ -1175,7 +1202,6 @@ class Learner:
             'train/grad_norm': float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
         }
         
-        # TensorBoard logging
         if self.writer is not None and global_step > 0:
             for key, value in stats.items():
                 self.writer.add_scalar(key, value, global_step)
@@ -1248,6 +1274,16 @@ class Learner:
         
         return advantages, returns
     
+    def _consolidate_si(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.si_omega:
+                delta = param.data - self.si_prev_params[name]
+                delta_norm = delta.pow(2) + self.si_epsilon
+                self.si_omega[name] += self.si_running_sum[name] / delta_norm
+                self.si_omega[name] = torch.clamp(self.si_omega[name], min=0.0)
+                self.si_prev_params[name] = param.data.clone()
+                self.si_running_sum[name].zero_()
+    
     def _update_lr(self):
         if self.config.lr_schedule == "constant":
             return
@@ -1259,7 +1295,6 @@ class Learner:
         elif self.config.lr_schedule == "cosine":
             lr = self.config.learning_rate * 0.5 * (1 + np.cos(np.pi * progress))
         elif self.config.lr_schedule == "cosine_restarts":
-            # Cosine annealing with warm restarts every 1000 updates
             restart_period = 1000
             cycle = self.update_count % restart_period
             cycle_progress = cycle / restart_period
@@ -1277,23 +1312,36 @@ class Learner:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'update_count': self.update_count,
             'nan_count': self.nan_count,
+            'si_omega': {k: v.cpu() for k, v in self.si_omega.items()},
+            'si_prev_params': {k: v.cpu() for k, v in self.si_prev_params.items()},
         }
         if extra:
             checkpoint.update(extra)
         torch.save(checkpoint, path)
         
     def load_checkpoint(self, path: Path) -> Dict:
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.update_count = checkpoint.get('update_count', 0)
         self.nan_count = checkpoint.get('nan_count', 0)
+        
+        if 'si_omega' in checkpoint:
+            for name in self.si_omega:
+                if name in checkpoint['si_omega']:
+                    self.si_omega[name] = checkpoint['si_omega'][name].to(self.device)
+        if 'si_prev_params' in checkpoint:
+            for name in self.si_prev_params:
+                if name in checkpoint['si_prev_params']:
+                    self.si_prev_params[name] = checkpoint['si_prev_params'][name].to(self.device)
+        
         return checkpoint
 
 class IMPALATrainer:
-    def __init__(self, config: TrainingConfig, model_config: Dict):
+    def __init__(self, config: TrainingConfig, model_config: Dict, resume_from: Optional[str] = None):
         self.config = config
         self.model_config = model_config
+        self.resume_from = resume_from
         
         self.log_dir = Path(config.log_dir)
         self.checkpoint_dir = Path(config.checkpoint_dir)
@@ -1312,22 +1360,27 @@ class IMPALATrainer:
         self.total_steps = 0
         self.start_time = None
         
-        # Progress tracking
         self.last_highest_unlocked = 0
         self.last_progress_step = 0
         
-        # Rolling stats for episode metrics
         self.episode_returns_buffer = defaultdict(list)
         self.episode_wins_buffer = defaultdict(list)
         self.episode_lengths_buffer = defaultdict(list)
         
+        # Checkpoint data (will be loaded if resuming)
+        self.checkpoint_data = None
+        
     def setup(self):
         print("=" * 60)
         print("IMPALA TRAINER SETUP (Reward-Based Curriculum)")
+        if self.resume_from:
+            print(f"RESUMING FROM: {self.resume_from}")
         print("=" * 60)
         
         # Initialize TensorBoard
         run_name = f"gfootball_mamba_{time.strftime('%Y%m%d_%H%M%S')}"
+        if self.resume_from:
+            run_name = f"gfootball_mamba_resumed_{time.strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir / run_name)
         print(f"TensorBoard logs: {self.log_dir / run_name}")
         
@@ -1342,10 +1395,10 @@ class IMPALATrainer:
             'clip_epsilon': self.config.clip_epsilon,
             'entropy_coeff': self.config.entropy_coeff,
             'value_coeff': self.config.value_coeff,
-            'd_model': self.model_config.get('d_model', 64),
-            'num_mamba_layers': self.model_config.get('num_mamba_layers', 4),
-            'stage_unlock_win_rate': self.config.stage_unlock_win_rate,
-            'stage_mastery_win_rate': self.config.stage_mastery_win_rate,
+            'd_model': self.model_config.get('d_model', 256),
+            'lstm_hidden': self.model_config.get('lstm_hidden', 256),
+            'si_lambda': self.config.si_lambda,
+            'resumed': self.resume_from is not None,
         }
         self.writer.add_hparams(hparams, {})
         
@@ -1360,15 +1413,29 @@ class IMPALATrainer:
         stages_dict = [asdict(s) for s in self.config.stages]
         baselines_dict = {k: v.to_dict() for k, v in self.calibrator.baselines.items()}
         
+        self.learner = Learner(self.config, self.model_config, self.writer)
+        
+        curriculum_initial_state = None
+        if self.resume_from:
+            checkpoint_path = Path(self.resume_from)
+            if checkpoint_path.exists():
+                print(f"\nLoading checkpoint: {checkpoint_path}")
+                self.checkpoint_data = self.learner.load_checkpoint(checkpoint_path)
+                
+                self.total_steps = self.checkpoint_data.get('total_steps', 0)
+                self.total_episodes = self.checkpoint_data.get('total_episodes', 0)
+                curriculum_initial_state = self.checkpoint_data.get('curriculum_stats', None)
+                
+                print(f"  Restored: steps={self.total_steps:,}, episodes={self.total_episodes}, updates={self.learner.update_count}")
+            else:
+                print(f"WARNING: Checkpoint not found: {checkpoint_path}")
+        
         self.curriculum = CurriculumController.remote(
             stages_dict, 
             baselines_dict,
-            unlock_win_rate=self.config.stage_unlock_win_rate,
-            unlock_min_episodes=self.config.stage_unlock_min_episodes,
-            mastery_win_rate=self.config.stage_mastery_win_rate,
             final_target_win_rate=self.config.final_stage_target_win_rate,
+            initial_state=curriculum_initial_state,
         )
-        self.learner = Learner(self.config, self.model_config, self.writer)
         
         print(f"Creating {self.config.num_workers} workers...")
         self.workers = [
@@ -1382,11 +1449,24 @@ class IMPALATrainer:
         ]
         
         self._sync_weights()
-        print(f"\nCurriculum settings:")
-        print(f"  Unlock threshold: {self.config.stage_unlock_win_rate:.0%} win rate")
-        print(f"  Mastery threshold: {self.config.stage_mastery_win_rate:.0%} win rate")
-        print(f"  Final stage target: {self.config.final_stage_target_win_rate:.0%} win rate")
-        print(f"  Min episodes for unlock: {self.config.stage_unlock_min_episodes}")
+        
+        if curriculum_initial_state:
+            self.last_highest_unlocked = len(curriculum_initial_state.get('learned_stages', []))
+            self.last_progress_step = self.total_steps
+        
+        print(f"\nCurriculum settings (Learning Progress + Staleness):")
+        print(f"  T_LEARN:   {CurriculumController.T_LEARN:.0%}")
+        print(f"  T_UNLOCK:  {CurriculumController.T_UNLOCK:.0%}")
+        print(f"  T_MASTERY: {CurriculumController.T_MASTERY:.0%}")
+        print(f"  LP_WINDOW: {CurriculumController.LP_WINDOW}")
+        print(f"  STALENESS_COEFF: {CurriculumController.STALENESS_COEFF}")
+        
+        if self.resume_from:
+            print(f"\nResumed training state:")
+            print(f"  Total steps: {self.total_steps:,}")
+            print(f"  Total episodes: {self.total_episodes}")
+            print(f"  Learner updates: {self.learner.update_count}")
+            
         print("Setup complete.\n")
         
     def _sync_weights(self):
@@ -1394,7 +1474,6 @@ class IMPALATrainer:
         ray.get([w.set_weights.remote(weights) for w in self.workers])
         
     def _aggregate_episode_stats(self, trajectories: List[Dict]):
-        """Aggregate episode statistics from trajectories."""
         for traj in trajectories:
             for i, (ret, won, length, stage_id) in enumerate(zip(
                 traj.get('episode_returns', []),
@@ -1407,11 +1486,9 @@ class IMPALATrainer:
                 self.episode_lengths_buffer[stage_id].append(length)
                 
     def _log_episode_stats(self):
-        """Log aggregated episode statistics to TensorBoard."""
         if self.writer is None:
             return
             
-        # Per-stage metrics
         all_returns = []
         all_wins = []
         all_lengths = []
@@ -1430,7 +1507,6 @@ class IMPALATrainer:
                 all_wins.extend(wins)
                 all_lengths.extend(lengths)
         
-        # Global metrics
         if all_returns:
             self.writer.add_scalar('episode/return_mean', np.mean(all_returns), self.total_steps)
             self.writer.add_scalar('episode/return_std', np.std(all_returns), self.total_steps)
@@ -1438,11 +1514,8 @@ class IMPALATrainer:
             self.writer.add_scalar('episode/return_max', np.max(all_returns), self.total_steps)
             self.writer.add_scalar('episode/win_rate', np.mean(all_wins), self.total_steps)
             self.writer.add_scalar('episode/length_mean', np.mean(all_lengths), self.total_steps)
-            
-            # Histogram of returns
             self.writer.add_histogram('episode/return_dist', np.array(all_returns), self.total_steps)
         
-        # Clear buffers
         self.episode_returns_buffer.clear()
         self.episode_wins_buffer.clear()
         self.episode_lengths_buffer.clear()
@@ -1450,7 +1523,8 @@ class IMPALATrainer:
     def train(self):
         print("Starting training (will stop when curriculum complete)...")
         self.start_time = time.time()
-        self.last_progress_step = 0
+        if self.last_progress_step == 0:
+            self.last_progress_step = self.total_steps
         
         pending = {
             w.collect_trajectory.remote(self.config.trajectory_length, self.curriculum): w 
@@ -1458,30 +1532,27 @@ class IMPALATrainer:
         }
         
         trajectories_buffer = []
-        update_count = 0
+        update_count = self.learner.update_count  # Start from restored count
         
         while True:
-            # Check stopping conditions
             curriculum_stats = ray.get(self.curriculum.get_stats.remote())
             
-            # Stop if curriculum complete (all stages solved)
             if curriculum_stats.get('training_complete', False):
                 print("\n" + "=" * 60)
                 print("🎉 TRAINING COMPLETE - All stages solved!")
                 print("=" * 60)
                 break
                 
-            # Stop if max steps reached
             if self.total_steps >= self.config.total_steps:
                 print("\n" + "=" * 60)
                 print("⚠️ Max steps reached without completing curriculum")
                 print("=" * 60)
                 break
                 
-            # Stop if no progress for too long
             highest_unlocked = curriculum_stats.get('highest_unlocked', 0)
-            if highest_unlocked > self.last_highest_unlocked:
-                self.last_highest_unlocked = highest_unlocked
+            num_learned = len(curriculum_stats.get('learned_stages', []))
+            if num_learned > self.last_highest_unlocked:
+                self.last_highest_unlocked = num_learned
                 self.last_progress_step = self.total_steps
             elif self.total_steps - self.last_progress_step > self.config.max_steps_without_progress:
                 print("\n" + "=" * 60)
@@ -1503,7 +1574,6 @@ class IMPALATrainer:
                     self.total_steps += int(traj_steps)
                     self.total_episodes += len(trajectory['episode_returns'])
                     
-                    # Aggregate episode stats
                     self._aggregate_episode_stats([trajectory])
                     
                 except Exception as e:
@@ -1530,7 +1600,6 @@ class IMPALATrainer:
                     self._log_progress(update_count, stats)
                     self._log_episode_stats()
                     
-                    # Log throughput and curriculum
                     if self.writer is not None:
                         elapsed = time.time() - self.start_time
                         sps = self.total_steps / elapsed if elapsed > 0 else 0
@@ -1546,7 +1615,6 @@ class IMPALATrainer:
                     
         self._save_checkpoint(update_count, final=True)
         
-        # Print final summary
         final_stats = ray.get(self.curriculum.get_stats.remote())
         print("\n=== FINAL CURRICULUM STATUS ===")
         print(ray.get(self.curriculum.get_progress_summary.remote()))
@@ -1564,33 +1632,52 @@ class IMPALATrainer:
         loss_str = f"Loss: {stats.get('loss/total', 0):.4f}"
         nan_str = f"NaN: {stats.get('train/nan_count', 0)}" if stats.get('train/nan_count', 0) > 0 else ""
         
-        print(f"[{update_count}] Steps: {self.total_steps:,} | Ep: {self.total_episodes} | SPS: {int(sps)} | {loss_str} {nan_str}")
-        
-        # Show curriculum progress
-        unlocked = curriculum_stats.get('unlocked_stages', [0])
+        learned = curriculum_stats.get('learned_stages', [])
         mastered = curriculum_stats.get('mastered_stages', [])
-        print(f"        Unlocked: {sorted(unlocked)} | Mastered: {sorted(mastered)}")
+        sample_probs = curriculum_stats.get('sample_probs', {})
+        
+        print(f"[{update_count}] Steps: {self.total_steps:,} | Ep: {self.total_episodes} | SPS: {int(sps)} | {loss_str} {nan_str}")
+        print(f"        Learned: {sorted(learned)} | Mastered: {sorted(mastered)}")
         
         stage_stats = curriculum_stats.get('stage_stats', {})
         if stage_stats:
-            # Show recent win rates for unlocked stages
             active = []
+            unlocked = curriculum_stats.get('unlocked_stages', [0])
             for sid in sorted(unlocked):
-                if sid in stage_stats:
-                    s = stage_stats[sid]
-                    recent_wr = s.get('recent_win_rate', s['ema_win'])
-                    marker = "⭐" if sid in mastered else ""
-                    active.append(f"S{sid}:{recent_wr:.0%}{marker}")
-            print(f"        Win rates: {', '.join(active)}")
+                sid_str = str(sid)
+                if sid_str in stage_stats:
+                    s = stage_stats[sid_str]
+                    if s['episodes'] > 0:
+                        recent_wr = s.get('recent_win_rate', s['ema_win'])
+                        lp = s.get('learning_progress', 0)
+                        prob = sample_probs.get(sid, 0) * 100
+                        
+                        marker = ""
+                        if sid in mastered:
+                            marker = "⭐"
+                        elif sid in learned:
+                            marker = "📚"
+                        
+                        lp_str = f"LP{lp:+.0%}" if abs(lp) > 0.02 else ""
+                        active.append(f"S{sid}:{recent_wr:.0%}{marker}({prob:.0f}%){lp_str}")
+            print(f"        {', '.join(active)}")
             
-            # Log curriculum stats to TensorBoard
             if self.writer is not None:
-                for sid, s in stage_stats.items():
-                    self.writer.add_scalar(f'curriculum/ema_return_stage_{sid}', s['ema_return'], self.total_steps)
+                for sid_str, s in stage_stats.items():
+                    sid = int(sid_str)
                     self.writer.add_scalar(f'curriculum/ema_win_stage_{sid}', s['ema_win'], self.total_steps)
-                    self.writer.add_scalar(f'curriculum/recent_win_rate_stage_{sid}', s.get('recent_win_rate', 0), self.total_steps)
-                    self.writer.add_scalar(f'curriculum/normalized_return_stage_{sid}', s['normalized_return'], self.total_steps)
+                    self.writer.add_scalar(f'curriculum/peak_win_stage_{sid}', s['peak_win'], self.total_steps)
+                    self.writer.add_scalar(f'curriculum/learning_progress_stage_{sid}', s.get('learning_progress', 0), self.total_steps)
+                    self.writer.add_scalar(f'curriculum/forgetting_stage_{sid}', s['forgetting'], self.total_steps)
+                    self.writer.add_scalar(f'curriculum/weight_stage_{sid}', s.get('weight', 0), self.total_steps)
+                    self.writer.add_scalar(f'curriculum/staleness_stage_{sid}', s.get('staleness', 0), self.total_steps)
                     self.writer.add_scalar(f'curriculum/episodes_stage_{sid}', s['episodes'], self.total_steps)
+                
+                for sid, prob in sample_probs.items():
+                    self.writer.add_scalar(f'curriculum/sample_prob_stage_{sid}', prob, self.total_steps)
+                
+                self.writer.add_scalar('curriculum/num_learned', len(learned), self.total_steps)
+                self.writer.add_scalar('curriculum/num_mastered', len(mastered), self.total_steps)
                       
     def _save_checkpoint(self, update_count: int, final: bool = False):
         suffix = "final" if final else f"update_{update_count}"
@@ -1615,55 +1702,56 @@ class IMPALATrainer:
         ray.shutdown()
 
 def main():
+    RESUME_FROM = None  # "./checkpoints/checkpoint_update_XXX.pt" für Resume
+    CHECKPOINT_DIR = "./checkpoints"
+    LOG_DIR = "./logs"
+    NUM_WORKERS = 24
+    
     model_config = {
-        'd_model': 128,
-        'mamba_state': 16,
-        'num_mamba_layers': 4,
-        'mamba_expand': 2,
-        'encoder_hidden': [256, 128],
-        'policy_hidden': [128, 64],
-        'value_hidden': [128, 64],
+        'd_model': 256,  # WeKick: 256
+        'lstm_hidden': 256,  # WeKick: 256
+        'lstm_layers': 1,
+        'encoder_hidden': [256, 256],  # WeKick: 256 dim each
+        'policy_hidden': [256],
+        'value_hidden': [256],
         'use_distributional': True,
         'dropout': 0.0,
+        'num_stages': len(get_default_stages()),
     }
     
     config = TrainingConfig(
         stages=get_default_stages(),
-        stage_unlock_win_rate=0.7,       # 70% win rate to unlock next stage
-        stage_unlock_min_episodes=100,    # Min episodes before unlock check
-        stage_mastery_win_rate=0.9,       # 90% to consider stage mastered
-        final_stage_target_win_rate=0.5,  # 50% on final stage to complete
-        max_steps_without_progress=100_000_000,  # Stop if stuck
-        num_workers=24,
+        final_stage_target_win_rate=0.5,
+        max_steps_without_progress=100_000_000,
+        num_workers=NUM_WORKERS,
         trajectory_length=128,
         batch_size=2048,
         minibatch_size=512,
         num_epochs=3,
-        learning_rate=3e-4,
+        learning_rate=1e-4,  # WeKick: 1e-4
         lr_schedule="cosine_restarts",
         gamma=0.998,
         gae_lambda=0.95,
         clip_epsilon=0.2,
         entropy_coeff=0.01,
         value_coeff=0.5,
+        si_lambda=0.1,
         max_grad_norm=0.5,
         total_steps=1_000_000_000,
         log_interval=10,
         checkpoint_interval=100,
         weight_sync_interval=5,
+        log_dir=LOG_DIR,
+        checkpoint_dir=CHECKPOINT_DIR,
     )
     
     ray.init(
-        num_cpus=22,
+        num_cpus=NUM_WORKERS,
         num_gpus=1,
-        object_store_memory=3 * 1024 * 1024 * 1024,
-        _system_config={
-            "object_spilling_threshold": 0.8,
-        },
         ignore_reinit_error=True,
     )
     
-    trainer = IMPALATrainer(config, model_config)
+    trainer = IMPALATrainer(config, model_config, resume_from=RESUME_FROM)
     
     try:
         trainer.setup()

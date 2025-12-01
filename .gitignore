@@ -15,6 +15,7 @@
 /cold_start/archive (1)/
 /cold_start/ducklake/
 /cold_start/xgboost_tuned/
+/logs*/
 
 *.err
 *.out
