@@ -3,7 +3,7 @@ import csv
 from pathlib import Path
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-ROOT_LOGDIR = r"C:\clones\rlib_gfootball\logs_mamba"
+ROOT_LOGDIR = r"C:\clones\rlib_gfootball\logs_vtrace"
 OUT_CSV = r"C:\clones\rlib_gfootball\feature_importance_analysis.csv"
 
 # ============================================================================
