@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=grf_ippo_hard_stochastic
+#SBATCH --job-name=gfootball_ippo_hard_stochastic
 #SBATCH --partition=mobile
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
