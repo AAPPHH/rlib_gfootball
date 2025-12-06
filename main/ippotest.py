@@ -15,14 +15,16 @@ class Config:
     num_agents: int = 10
     action_dim: int = 19
     obs_dim: int = 217
-    num_workers: int = 24
-    buffer_capacity: int = 250
-    batch_size: int = 80
+    # === A100 + 256 CPU Config (wie DB-Football System#2) ===
+    num_workers: int = 150
+    buffer_capacity: int = 1000
+    batch_size: int = 300
     buffer_max_usage: int = 3
     rollout_length: int = 3000
     sample_length: int = 1000
     policy_update_interval: int = 10
     trainer_pull_interval: float = 0.05
+    # === PPO Hyperparameter (exakt wie Paper) ===
     actor_lr: float = 5e-4
     critic_lr: float = 5e-4
     optimizer_eps: float = 1e-5
@@ -30,7 +32,7 @@ class Config:
     critic_hidden: Tuple[int, ...] = (256, 128, 64)
     ppo_epochs: int = 5
     gae_lambda: float = 0.95
-    gamma: float = 1.0
+    gamma: float = 1.0  # KRITISCH: muss 1.0 sein für GRF
     entropy_coef: float = 0.0001
     clip_param: float = 0.2
     kl_early_stop: float = 0.01
@@ -43,9 +45,9 @@ class Config:
     init_gain: float = 1.0
     max_iterations: int = 2000
     target_win_rate: float = 0.8
-    save_interval: int = 100
+    save_interval: int = 50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    experiment_name: str = "grf_i9_4080"
+    experiment_name: str = "grf_a100_ippo"
     reward_type: str = "simple"
 
 class RewardShaper:
@@ -338,7 +340,7 @@ class PolicyServer:
 
 @ray.remote
 class DataServer:
-    def __init__(self, capacity=250, max_usage=3):
+    def __init__(self, capacity=1000, max_usage=3):
         self.capacity = capacity
         self.max_usage = max_usage
         self.buffer = []
@@ -413,17 +415,9 @@ class RolloutWorker:
                 number_of_right_players_agent_controls=0, render=False,
                 write_video=False, write_full_episode_dumps=False, write_goal_dumps=False, logdir='')
             return True
-        except: return False
-    def _mock(self):
-        return {'ball': np.random.uniform(-1, 1, 3).astype(np.float32),
-                'ball_direction': np.zeros(3, dtype=np.float32),
-                'ball_owned_team': np.random.choice([-1, 0, 1]),
-                'ball_owned_player': np.random.randint(0, 11),
-                'left_team': np.random.uniform(-1, 1, (11, 2)).astype(np.float32),
-                'left_team_direction': np.zeros((11, 2), dtype=np.float32),
-                'right_team': np.random.uniform(-1, 1, (11, 2)).astype(np.float32),
-                'right_team_direction': np.zeros((11, 2), dtype=np.float32),
-                'active': 0, 'game_mode': 0, 'score': [0, 0], 'steps_left': 3000}
+        except Exception as e:
+            print(f"Worker {self.wid} env failed: {e}")
+            return False
     def _update_policy(self):
         w, v = ray.get(self.policy_server.get_weights.remote())
         if w is not None and v > self.pv:
@@ -431,7 +425,7 @@ class RolloutWorker:
             self.pv = v
     def _reset(self):
         self.shaper.reset()
-        raw = self.env.reset() if self.env else [self._mock() for _ in range(self.cfg.num_agents)]
+        raw = self.env.reset()
         obs, masks = [], []
         for i in range(self.cfg.num_agents):
             o = raw[i] if isinstance(raw, list) else raw
@@ -439,12 +433,7 @@ class RolloutWorker:
             masks.append(self.masking.get_mask(o, i))
         return np.stack(obs), np.stack(masks), raw
     def _step(self, actions):
-        if self.env:
-            raw, _, done, info = self.env.step(actions.tolist())
-        else:
-            raw = [self._mock() for _ in range(self.cfg.num_agents)]
-            done = np.random.random() < 0.001
-            info = {'score': [0, 0]}
+        raw, _, done, info = self.env.step(actions.tolist())
         obs, masks = [], []
         for i in range(self.cfg.num_agents):
             o = raw[i] if isinstance(raw, list) else raw
@@ -634,7 +623,9 @@ class GRFTrainer:
         self.best_wr = 0.0
         self.start = None
         self.total_steps = 0
-        ray.init(ignore_reinit_error=True, logging_level=40)
+        # Ray wird extern via SLURM gestartet, nur connecten
+        if not ray.is_initialized():
+            ray.init(address='auto', ignore_reinit_error=True, logging_level=40)
         self.policy_server = PolicyServer.remote()
         self.data_server = DataServer.remote(self.cfg.buffer_capacity, self.cfg.buffer_max_usage)
         self.trainer = AsyncTrainer.remote(self.cfg, self.policy_server, self.data_server)
@@ -728,7 +719,6 @@ class GRFTrainer:
         print(f"{'='*60}")
         print(f"Done | {elapsed/3600:.1f}h | {self.total_steps/1e6:.1f}M steps | Best: {self._fmt_wr(self.best_wr)}")
         print(f"{'='*60}")
-        ray.shutdown()
 
 if __name__ == "__main__":
     cfg = Config()

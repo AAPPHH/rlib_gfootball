@@ -517,10 +517,10 @@ def get_default_stages():
         StageConfig(7, "academy_counterattack_hard", "simple115v2", 4, 0, 600),
         StageConfig(8, "academy_single_goal_versus_lazy", "simple115v2", 4, 0, 1000),
         StageConfig(9, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000),
-        StageConfig(10, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000, "scoring"),
-        StageConfig(11, "11_vs_11_easy_stochastic", "simple115v2", 11, 0, 3000, "scoring"),
-        StageConfig(12, "11_vs_11_stochastic", "simple115v2", 11, 0, 3000, "scoring"),
-        StageConfig(13, "11_vs_11_hard_stochastic", "simple115v2", 11, 0, 3000, "scoring"),
+        StageConfig(10, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000),
+        StageConfig(11, "11_vs_11_easy_stochastic", "simple115v2", 11, 0, 3000),
+        StageConfig(12, "11_vs_11_stochastic", "simple115v2", 11, 0, 3000),
+        StageConfig(13, "11_vs_11_hard_stochastic", "simple115v2", 11, 0, 3000),
     ]
 
 @dataclass
@@ -1483,7 +1483,7 @@ class IMPALATrainer:
         ray.shutdown()
 
 def main():
-    RESUME_FROM = None  # e.g., "./checkpoints_hybrid/checkpoint_update_1000.pt"
+    RESUME_FROM = r"C:\clones\rlib_gfootball\checkpoints_hybrid\checkpoint_update_2900.pt"
     CHECKPOINT_DIR, LOG_DIR, NUM_WORKERS = "./checkpoints_hybrid", "./logs_hybrid", 24
     model_config = {
         'obs_dim': OBS_DIM,
@@ -1513,7 +1513,7 @@ def main():
         gamma=1.0,
         rho_bar=1.0,
         c_bar=1.0,
-        entropy_coeff=0.0001,
+        entropy_coeff=0.01,
         value_coeff=0.5,
         si_lambda=1.0,
         max_grad_norm=0.5,
