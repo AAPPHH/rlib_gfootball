@@ -7,13 +7,10 @@
 #SBATCH --mem-per-cpu=6GB
 #SBATCH --gres=gpu:1
 #SBATCH --time=30-00:00:00
-#SBATCH --output=/home/john/grf_ippo/ray_%j.out
-#SBATCH --error=/home/john/grf_ippo/ray_%j.err
+#SBATCH --output=/home/john/rlib_gfootball/main/grf_ippo/ray_%j.out
+#SBATCH --error=/home/john/rlib_gfootball/main/grf_ippo/ray_%j.err
 
 set -x
-
-# === CPU/GPU-Defaults für Single-Node ===
-: "${SLURM_GPUS_PER_TASK:=1}"
 
 # --- Conda aktivieren ---
 source /home/john/miniforge/etc/profile.d/conda.sh
@@ -31,44 +28,19 @@ echo "PyTorch: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA: $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "===================="
 
-# --- Kurzer Temp-Pfad für Ray ---
-BASE_STORAGE=/home/john/grf_ippo/ray_temp_${SLURM_JOB_ID}
-NODE=$(hostname -s)
-mkdir -p "$BASE_STORAGE/$NODE"
-SHORT_LINK=/tmp/r_${SLURM_JOB_ID}
-ln -sfn "$BASE_STORAGE/$NODE" "$SHORT_LINK"
-export RAY_TEMP_DIR="$SHORT_LINK"
+# --- Ray Temp-Pfad (optional, verhindert /tmp overflow) ---
+export RAY_TMPDIR=/home/john/grf_ippo/ray_temp_${SLURM_JOB_ID}
+mkdir -p "$RAY_TMPDIR"
 
-echo "=== Storage Setup ==="
-echo "Real storage: $BASE_STORAGE/$NODE"
-echo "Short link:   $SHORT_LINK"
-echo "Ray temp dir: $RAY_TEMP_DIR"
-echo "====================="
+echo "=== Training Start ==="
+echo "Job ID: $SLURM_JOB_ID"
+echo "CPUs: $SLURM_CPUS_PER_TASK"
+echo "Ray temp: $RAY_TMPDIR"
+echo "======================"
 
-# === Single-Node Ray starten ===
-port=6379
-ip_head="127.0.0.1:${port}"
-echo "IP Head: $ip_head"
-
-# Vorsichtshalber alte Instanz stoppen
-ray stop || true
-
-/home/john/miniforge/envs/football_cuda/bin/ray start --head \
-  --node-ip-address=127.0.0.1 \
-  --port=$port \
-  --dashboard-host=0.0.0.0 \
-  --num-cpus=${SLURM_CPUS_PER_TASK} \
-  --num-gpus=${SLURM_GPUS_PER_TASK} \
-  --temp-dir="$RAY_TEMP_DIR"
-
-echo "=== Cluster-Status (Single-Node) ==="
-ray status || true
-echo "===================================="
-
-# === Hauptskript ausführen ===
-echo "Starte GRF IPPO Training..."
-python -u /home/john/grf_ippo/train_grf.py
+# === Hauptskript ausführen (ray.init() startet automatisch) ===
+python -u /home/john/rlib_gfootball/main/mamba_hammer.py
 
 # === Aufräumen ===
-echo "Beende Ray..."
-ray stop
+echo "Räume auf..."
+rm -rf "$RAY_TMPDIR"
