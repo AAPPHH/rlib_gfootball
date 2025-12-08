@@ -3,7 +3,7 @@ import json
 import time
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List
 from collections import defaultdict
 import numpy as np
 import torch
@@ -14,7 +14,6 @@ from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import ray
 import gfootball.env as football_env
-
 FEATURE_NAMES = [
     'ball_x', 'ball_y', 'ball_z', 'ball_speed', 'ball_dir_x', 'ball_dir_y', 'ball_owned_team',
     'rel_ball_x', 'rel_ball_y', 'dist_to_ball', 'angle_to_ball',
@@ -58,7 +57,6 @@ FEATURE_GROUPS = {
 }
 FEATURE_DIM = 93
 OBS_DIM = 460
-
 class FeatureEngineer:
     FEATURE_DIM = 93
     GOAL_POS = np.array([1.0, 0.0], dtype=np.float32)
@@ -215,7 +213,6 @@ class FeatureEngineer:
         if squeeze_output:
             return feat[0]
         return feat
-
 @dataclass
 class ModelConfig:
     obs_dim: int = OBS_DIM
@@ -232,7 +229,7 @@ class ModelConfig:
     v_min: float = -10.0
     v_max: float = 10.0
     num_atoms: int = 51
-    num_stages: int = 14
+    num_stages: int = 10
     stage_emb_dim: int = 8
     dropout: float = 0.0
     segment_size: int = 16
@@ -243,7 +240,6 @@ class ModelConfig:
             self.policy_hidden = [256]
         if self.value_hidden is None:
             self.value_hidden = [256]
-
 class MambaBlock(nn.Module):
     def __init__(self, d_model, d_state=64, dropout=0.0, segment_size=16):
         super().__init__()
@@ -307,7 +303,6 @@ class MambaBlock(nn.Module):
             y = torch.stack(outputs, dim=1)
         out = y * F.silu(z) + x_in * self.D
         return x + self.dropout(self.out_proj(out)), h.view(B, -1)
-
 class MambaEncoder(nn.Module):
     def __init__(self, input_dim, d_model=256, d_state=64, num_layers=4, dropout=0.0, segment_size=16):
         super().__init__()
@@ -329,7 +324,6 @@ class MambaEncoder(nn.Module):
         return self.final_norm(x), new_states
     def get_initial_hidden_state(self, batch_size, device):
         return [torch.zeros(batch_size, self.state_size, device=device) for _ in range(self.num_layers)]
-
 class GFootballPolicyValueNet(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -484,13 +478,10 @@ class GFootballPolicyValueNet(nn.Module):
         return dist.log_prob(actions), dist.entropy(), output['value']
     def get_initial_hidden_state(self, batch_size, device):
         return self.mamba.get_initial_hidden_state(batch_size, device)
-
 def create_model(config_dict=None):
     return GFootballPolicyValueNet(ModelConfig(**(config_dict or {})))
-
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
 @dataclass
 class StageConfig:
     stage_id: int
@@ -504,7 +495,6 @@ class StageConfig:
     def __post_init__(self):
         if self.reward_type == -1:
             self.reward_type = 1 if self.rewards == "scoring" else 0
-
 def get_default_stages():
     return [
         StageConfig(0, "academy_empty_goal_close", "simple115v2", 1, 0, 400),
@@ -517,16 +507,11 @@ def get_default_stages():
         StageConfig(7, "academy_counterattack_hard", "simple115v2", 4, 0, 600),
         StageConfig(8, "academy_single_goal_versus_lazy", "simple115v2", 4, 0, 1000),
         StageConfig(9, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000),
-        StageConfig(10, "academy_single_goal_versus_lazy", "simple115v2", 11, 0, 1000),
-        StageConfig(11, "11_vs_11_easy_stochastic", "simple115v2", 11, 0, 3000),
-        StageConfig(12, "11_vs_11_stochastic", "simple115v2", 11, 0, 3000),
-        StageConfig(13, "11_vs_11_hard_stochastic", "simple115v2", 11, 0, 3000),
     ]
-
 @dataclass
 class TrainingConfig:
     stages: List[StageConfig] = field(default_factory=list)
-    final_stage_target_win_rate: float = 0.5
+    final_stage_target_win_rate: float = 0.95
     max_steps_without_progress: int = 500_000
     num_workers: int = 20
     envs_per_worker: int = 1
@@ -564,7 +549,6 @@ class TrainingConfig:
     def __post_init__(self):
         if not self.stages:
             self.stages = get_default_stages()
-
 @dataclass
 class StageBaseline:
     stage_id: int
@@ -583,7 +567,6 @@ class StageBaseline:
     @classmethod
     def from_dict(cls, d):
         return cls(**d)
-
 @ray.remote
 def _calibrate_stage_batch(stage_dict, num_episodes, worker_id):
     stage = StageConfig(**stage_dict)
@@ -604,7 +587,6 @@ def _calibrate_stage_batch(stage_dict, num_episodes, worker_id):
         wins.append(1.0 if won else 0.0)
     env.close()
     return {'stage_id': stage.stage_id, 'worker_id': worker_id, 'returns': returns, 'wins': wins, 'step_rewards': step_rewards, 'lengths': lengths}
-
 class BaselineCalibrator:
     def __init__(self, stages, save_path):
         self.stages, self.save_path = stages, save_path
@@ -655,16 +637,16 @@ class BaselineCalibrator:
             bl.calibrated = True
             print(f"  Stage {stage.stage_id}: return={bl.episode_return_mean:.3f}±{bl.episode_return_std:.3f}, win={bl.win_rate:.1%}")
         self.save()
-
 @ray.remote
 class CurriculumController:
     T_LEARN, T_UNLOCK, T_MASTERY = 0.65, 0.85, 0.95
     MIN_EPS_UNLOCK, LP_WINDOW, STALENESS_COEFF, MIN_WEIGHT, SUSTAINED_WINDOW = 100, 200, 0.2, 0.05, 50
-    def __init__(self, stages, baselines, final_target_win_rate=0.5, initial_state=None):
+    def __init__(self, stages, baselines, final_target_win_rate=0.95, initial_state=None):
         self.stages = [StageConfig(**s) if isinstance(s, dict) else s for s in stages]
         self.baselines = {int(k): StageBaseline.from_dict(v) if isinstance(v, dict) else v for k, v in baselines.items()}
         self.num_stages = len(self.stages)
         self.final_target_win_rate = final_target_win_rate
+        self.perfect_achieved = {s.stage_id: False for s in self.stages}
         self._restore_state(initial_state) if initial_state else self._init_fresh()
     def _init_fresh(self):
         self.episode_count, self.unlocked_stages, self.learned_stages, self.mastered_stages = 0, {0}, set(), set()
@@ -674,6 +656,7 @@ class CurriculumController:
         self.unlocked_stages = set(state.get('unlocked_stages', [0]))
         self.learned_stages = set(state.get('learned_stages', []))
         self.mastered_stages = set(state.get('mastered_stages', []))
+        self.perfect_achieved = state.get('perfect_achieved', {s.stage_id: False for s in self.stages})
         saved_stats = state.get('stage_stats', {})
         self.stage_stats = {}
         for s in self.stages:
@@ -748,6 +731,30 @@ class CurriculumController:
         self._check_learned(stage_id)
         self._check_unlock(stage_id)
         self._check_mastery(stage_id)
+        return self._check_special_saves(stage_id)
+    def _check_special_saves(self, stage_id):
+        result = {'save_95_all': False, 'save_100': False, 'stage_100': None}
+        stats = self.stage_stats[stage_id]
+        if len(stats['recent_wins']) >= 50:
+            recent_wr = np.mean(stats['recent_wins'][-50:])
+            if recent_wr >= 1.0 and not self.perfect_achieved.get(stage_id, False):
+                self.perfect_achieved[stage_id] = True
+                result['save_100'] = True
+                result['stage_100'] = stage_id
+                print(f"\n🏆 PERFECT 100% on Stage {stage_id}!\n")
+        all_95 = True
+        for sid in range(self.num_stages):
+            s = self.stage_stats[sid]
+            if s['episodes'] < 50:
+                all_95 = False
+                break
+            wr = np.mean(s['recent_wins'][-50:]) if len(s['recent_wins']) >= 50 else 0
+            if wr < 0.95:
+                all_95 = False
+                break
+        if all_95:
+            result['save_95_all'] = True
+        return result
     def _check_learned(self, stage_id):
         if stage_id in self.learned_stages:
             return
@@ -800,8 +807,7 @@ class CurriculumController:
     def get_stats(self):
         weights = {sid: self._compute_weight(sid) for sid in self.unlocked_stages}
         total_w = sum(weights.values())
-        return {'episode_count': self.episode_count, 'unlocked_stages': list(self.unlocked_stages), 'learned_stages': list(self.learned_stages), 'mastered_stages': list(self.mastered_stages), 'highest_unlocked': max(self.unlocked_stages) if self.unlocked_stages else 0, 'training_complete': self.is_training_complete(), 'sample_probs': {sid: w / total_w for sid, w in weights.items()}, 'stage_stats': {str(sid): {'episodes': s['episodes'], 'ema_return': s['ema_return'], 'ema_win': s['ema_win'], 'ema_win_slow': s['ema_win_slow'], 'sustained_peak': s['sustained_peak'], 'max_reward': s['max_reward'] if s['max_reward'] > -float('inf') else 0, 'learning_progress': self._compute_learning_progress(sid), 'forgetting': self._compute_forgetting(sid), 'recent_win_rate': np.mean(s['recent_wins']) if s['recent_wins'] else 0} for sid, s in self.stage_stats.items()}}
-
+        return {'episode_count': self.episode_count, 'unlocked_stages': list(self.unlocked_stages), 'learned_stages': list(self.learned_stages), 'mastered_stages': list(self.mastered_stages), 'highest_unlocked': max(self.unlocked_stages) if self.unlocked_stages else 0, 'training_complete': self.is_training_complete(), 'perfect_achieved': self.perfect_achieved, 'sample_probs': {sid: w / total_w for sid, w in weights.items()}, 'stage_stats': {str(sid): {'episodes': s['episodes'], 'ema_return': s['ema_return'], 'ema_win': s['ema_win'], 'ema_win_slow': s['ema_win_slow'], 'sustained_peak': s['sustained_peak'], 'max_reward': s['max_reward'] if s['max_reward'] > -float('inf') else 0, 'learning_progress': self._compute_learning_progress(sid), 'forgetting': self._compute_forgetting(sid), 'recent_win_rate': np.mean(s['recent_wins']) if s['recent_wins'] else 0} for sid, s in self.stage_stats.items()}}
 @ray.remote
 class SamplerWorker:
     MAX_AGENTS = 11
@@ -822,6 +828,7 @@ class SamplerWorker:
         obs_list, feature_list, action_list, reward_list, done_list = [], [], [], [], []
         value_list, log_prob_list, stage_list, mask_list, reward_type_list = [], [], [], [], []
         episode_returns, episode_wins, episode_lengths, episode_stages, episode_max_rewards = [], [], [], [], []
+        special_saves = []
         steps, ep_max_reward = 0, -float('inf')
         while steps < trajectory_length:
             if self.env is None or self._should_switch_stage():
@@ -895,10 +902,12 @@ class SamplerWorker:
                 episode_lengths.append(self.episode_steps)
                 episode_stages.append(self.current_stage.stage_id)
                 episode_max_rewards.append(ep_max_reward)
-                ray.get(curriculum_controller.report_episode.remote(self.current_stage.stage_id, self.episode_return, won))
+                save_result = ray.get(curriculum_controller.report_episode.remote(self.current_stage.stage_id, self.episode_return, won))
+                if save_result:
+                    special_saves.append(save_result)
                 self._reset_episode()
                 ep_max_reward = -float('inf')
-        return {'obs': np.array(obs_list, dtype=np.float32), 'features': np.array(feature_list, dtype=np.float32), 'actions': np.array(action_list, dtype=np.int64), 'rewards': np.array(reward_list, dtype=np.float32), 'dones': np.array(done_list, dtype=np.float32), 'values': np.array(value_list, dtype=np.float32), 'log_probs': np.array(log_prob_list, dtype=np.float32), 'stage_ids': np.array(stage_list, dtype=np.int64), 'agent_masks': np.array(mask_list, dtype=np.float32), 'reward_types': np.array(reward_type_list, dtype=np.int64), 'worker_id': self.worker_id, 'episode_returns': episode_returns, 'episode_wins': episode_wins, 'episode_lengths': episode_lengths, 'episode_stages': episode_stages, 'episode_max_rewards': episode_max_rewards}
+        return {'obs': np.array(obs_list, dtype=np.float32), 'features': np.array(feature_list, dtype=np.float32), 'actions': np.array(action_list, dtype=np.int64), 'rewards': np.array(reward_list, dtype=np.float32), 'dones': np.array(done_list, dtype=np.float32), 'values': np.array(value_list, dtype=np.float32), 'log_probs': np.array(log_prob_list, dtype=np.float32), 'stage_ids': np.array(stage_list, dtype=np.int64), 'agent_masks': np.array(mask_list, dtype=np.float32), 'reward_types': np.array(reward_type_list, dtype=np.int64), 'worker_id': self.worker_id, 'episode_returns': episode_returns, 'episode_wins': episode_wins, 'episode_lengths': episode_lengths, 'episode_stages': episode_stages, 'episode_max_rewards': episode_max_rewards, 'special_saves': special_saves}
     def _setup_env(self, stage):
         if self.env is not None:
             self.env.close()
@@ -924,7 +933,6 @@ class SamplerWorker:
     def close(self):
         if self.env is not None:
             self.env.close()
-
 def parallel_vtrace_scan(values, rewards, dones, rho, c, gamma, bootstrap_value):
     N = len(values)
     not_done = 1 - dones
@@ -943,7 +951,6 @@ def parallel_vtrace_scan(values, rewards, dones, rho, c, gamma, bootstrap_value)
         a_flip = a_flip + b_flip * a_shifted
         b_flip = b_flip * b_shifted
     return a_flip.flip(0)
-
 class Learner:
     def __init__(self, config, model_config, writer=None):
         self.config, self.device, self.writer = config, torch.device(config.device), writer
@@ -971,10 +978,6 @@ class Learner:
         self.si_lambda, self.si_epsilon = config.si_lambda, 1e-3
         self.feature_importance_history = defaultdict(list)
         print(f"Learner on {self.device}, params: {count_parameters(self.model):,}")
-        print(f"  V-Trace: rho_bar={config.rho_bar}, c_bar={config.c_bar}")
-        print(f"  Hybrid Features: {FEATURE_DIM} dimensions")
-        print(f"  Mixed Precision: encoder=fp16, mamba+heads=fp32")
-        print(f"  Gradient Checkpointing: all segments")
     def _update_ema(self):
         if not self.ema_enabled or self.update_count < self.ema_start_step:
             return
@@ -1005,26 +1008,8 @@ class Learner:
         importance = np.where(active_mask, grad, 0.0)
         if importance.max() > 0:
             importance = importance / importance.max()
-        unique_stages = stage_ids.unique().cpu().numpy()
-        stage_importance = {}
-        for stage in unique_stages:
-            stage_mask = stage_ids == stage
-            if stage_mask.sum() < 10:
-                continue
-            stage_features = features[stage_mask].detach()
-            stage_grad = features.grad[stage_mask].abs().mean(dim=0).cpu().numpy()
-            stage_var = stage_features.var(dim=0).cpu().numpy()
-            stage_active = stage_var > VAR_THRESHOLD
-            stage_imp = np.where(stage_active, stage_grad, 0.0)
-            if stage_imp.max() > 0:
-                stage_imp = stage_imp / stage_imp.max()
-            stage_importance[int(stage)] = stage_imp
         self.model.train()
-        n_active = active_mask.sum()
-        if self.update_count % 100 == 0:
-            active_names = [FEATURE_NAMES[i] for i in range(len(active_mask)) if active_mask[i] and i < len(FEATURE_NAMES)]
-            print(f"Active features ({n_active}/{FEATURE_DIM}): {', '.join(active_names[:10])}...")
-        return importance, stage_importance
+        return importance, {}
     def _log_feature_importance(self, importance, stage_importance=None):
         if self.writer is None:
             return
@@ -1194,12 +1179,7 @@ class Learner:
                 explained_var = float(1 - (vtrace_targets[sample_idx] - sample_values.float()).var() / var_y if var_y > 1e-6 else 0.0)
         total_dense_samples = (reward_types == 0).sum().item()
         total_sparse_samples = (reward_types == 1).sum().item()
-        result = {'loss/total': total_loss / num_updates, 'loss/policy': policy_loss_sum / num_updates, 'loss/value': value_loss_sum / num_updates, 'loss/entropy': entropy_sum / num_updates, 'vtrace/rho_mean': rho_sum / num_updates, 'vtrace/rho_max': rho.max().item(), 'vtrace/explained_variance': explained_var, 'train/lr': self.optimizer.param_groups[0]['lr'], 'train/nan_count': self.nan_count, 'train/grad_norm': float(grad_norm), 'value_heads/dense_samples': total_dense_samples, 'value_heads/sparse_samples': total_sparse_samples}
-        if dense_count > 0:
-            result['value_heads/dense_loss'] = dense_value_loss_sum / dense_count
-        if sparse_count > 0:
-            result['value_heads/sparse_loss'] = sparse_value_loss_sum / sparse_count
-        return result
+        return {'loss/total': total_loss / num_updates, 'loss/policy': policy_loss_sum / num_updates, 'loss/value': value_loss_sum / num_updates, 'loss/entropy': entropy_sum / num_updates, 'vtrace/rho_mean': rho_sum / num_updates, 'vtrace/rho_max': rho.max().item(), 'vtrace/explained_variance': explained_var, 'train/lr': self.optimizer.param_groups[0]['lr'], 'train/nan_count': self.nan_count, 'train/grad_norm': float(grad_norm), 'value_heads/dense_samples': total_dense_samples, 'value_heads/sparse_samples': total_sparse_samples, 'value_heads/dense_loss': dense_value_loss_sum / dense_count if dense_count > 0 else 0, 'value_heads/sparse_loss': sparse_value_loss_sum / sparse_count if sparse_count > 0 else 0}
     def _consolidate_si(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.si_omega:
@@ -1214,7 +1194,6 @@ class Learner:
             self.steps_since_stage_change = 0
             self.lr_reductions_this_stage = 0
             self.lp_history.clear()
-            print(f"\n🔓 Stage {highest_unlocked_stage} unlocked - LR: {self.current_lr:.2e}\n")
         self.lp_history.append(frontier_lp)
         if len(self.lp_history) > self.config.lr_plateau_window:
             self.lp_history.pop(0)
@@ -1248,13 +1227,10 @@ class Learner:
                 pg['lr'] = max(lr, 1e-7)
             return
         if self._check_plateau(frontier_episodes):
-            old_lr = self.current_lr
             self.current_lr = max(self.current_lr * cfg.lr_plateau_factor, cfg.lr_min)
             self.lr_reductions_this_stage += 1
             self.cooldown_counter = cfg.lr_plateau_cooldown
             self.lp_history.clear()
-            if self.writer:
-                self.writer.add_scalar('train/lr_reduction', 1.0, self.update_count)
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.current_lr
     def save_checkpoint(self, path, extra=None):
@@ -1289,7 +1265,6 @@ class Learner:
         for pg in self.optimizer.param_groups:
             pg['lr'] = self.current_lr
         return ckpt
-
 class IMPALATrainer:
     def __init__(self, config, model_config, resume_from=None):
         self.config, self.model_config, self.resume_from = config, model_config, resume_from
@@ -1306,13 +1281,15 @@ class IMPALATrainer:
         self.episode_lengths_buffer = defaultdict(list)
         self.episode_max_rewards_buffer = defaultdict(list)
         self.checkpoint_data = None
+        self.saved_95_all = False
+        self.saved_100_stages = set()
     def setup(self):
         print("=" * 60)
-        print(f"IMPALA TRAINER - V-TRACE + {FEATURE_DIM} HYBRID FEATURES")
+        print(f"IMPALA TRAINER - STAGES 0-9 (LAZY)")
         if self.resume_from:
             print(f"RESUMING FROM: {self.resume_from}")
         print("=" * 60)
-        run_name = f"gfootball_hybrid_{time.strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"gfootball_stage9_{time.strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=self.log_dir / run_name)
         if not self.calibrator.load():
             self.calibrator.calibrate(num_episodes=100, num_workers=min(self.config.num_workers, 8))
@@ -1328,6 +1305,8 @@ class IMPALATrainer:
                 self.total_steps = self.checkpoint_data.get('total_steps', 0)
                 self.total_episodes = self.checkpoint_data.get('total_episodes', 0)
                 curriculum_initial_state = self.checkpoint_data.get('curriculum_stats', None)
+                self.saved_95_all = self.checkpoint_data.get('saved_95_all', False)
+                self.saved_100_stages = set(self.checkpoint_data.get('saved_100_stages', []))
         self.curriculum = CurriculumController.remote(stages_dict, baselines_dict, final_target_win_rate=self.config.final_stage_target_win_rate, initial_state=curriculum_initial_state)
         self.workers = [SamplerWorker.remote(worker_id=i, model_config=self.model_config, stages=stages_dict, baselines=baselines_dict) for i in range(self.config.num_workers)]
         self._sync_weights()
@@ -1344,6 +1323,20 @@ class IMPALATrainer:
                 self.episode_lengths_buffer[stage_id].append(length)
             for stage_id, max_r in zip(traj.get('episode_stages', []), traj.get('episode_max_rewards', [])):
                 self.episode_max_rewards_buffer[stage_id].append(max_r)
+    def _check_special_saves(self, trajectories):
+        for traj in trajectories:
+            for save_info in traj.get('special_saves', []):
+                if save_info.get('save_100') and save_info.get('stage_100') not in self.saved_100_stages:
+                    stage = save_info['stage_100']
+                    self.saved_100_stages.add(stage)
+                    path = self.checkpoint_dir / f"checkpoint_100pct_stage{stage}.pt"
+                    self.learner.save_checkpoint(path, extra={'total_steps': self.total_steps, 'total_episodes': self.total_episodes, 'curriculum_stats': ray.get(self.curriculum.get_stats.remote()), 'saved_95_all': self.saved_95_all, 'saved_100_stages': list(self.saved_100_stages), 'milestone': f'100% on stage {stage}'})
+                    print(f"\n💾 SAVED: 100% checkpoint for Stage {stage} -> {path}\n")
+                if save_info.get('save_95_all') and not self.saved_95_all:
+                    self.saved_95_all = True
+                    path = self.checkpoint_dir / f"checkpoint_95pct_all_stages.pt"
+                    self.learner.save_checkpoint(path, extra={'total_steps': self.total_steps, 'total_episodes': self.total_episodes, 'curriculum_stats': ray.get(self.curriculum.get_stats.remote()), 'saved_95_all': self.saved_95_all, 'saved_100_stages': list(self.saved_100_stages), 'milestone': '95% on all stages'})
+                    print(f"\n💾 SAVED: 95% ALL STAGES checkpoint -> {path}\n")
     def _log_episode_stats(self):
         if self.writer is None:
             return
@@ -1373,7 +1366,7 @@ class IMPALATrainer:
         while True:
             curriculum_stats = ray.get(self.curriculum.get_stats.remote())
             if curriculum_stats.get('training_complete', False):
-                print("\n🎉 TRAINING COMPLETE!")
+                print("\n🎉 TRAINING COMPLETE - 95% on Stage 9!")
                 break
             if self.total_steps >= self.config.total_steps:
                 print("\n⚠️ Max steps reached")
@@ -1394,6 +1387,7 @@ class IMPALATrainer:
                     self.total_steps += int(len(trajectory['obs']) * (trajectory['agent_masks'].sum() / len(trajectory['obs'])))
                     self.total_episodes += len(trajectory['episode_returns'])
                     self._aggregate_episode_stats([trajectory])
+                    self._check_special_saves([trajectory])
                 except Exception as e:
                     print(f"Worker error: {e}")
                 pending[worker.collect_trajectory.remote(self.config.trajectory_length, self.curriculum)] = worker
@@ -1428,22 +1422,9 @@ class IMPALATrainer:
         mastered = curriculum_stats.get('mastered_stages', [])
         stage_stats = curriculum_stats.get('stage_stats', {})
         sample_probs = curriculum_stats.get('sample_probs', {})
-        def fmt_range(stages):
-            if not stages:
-                return "∅"
-            stages = sorted(stages)
-            return f"{stages[0]}-{stages[-1]}" if stages == list(range(stages[0], stages[-1] + 1)) else ",".join(map(str, stages))
         lr = self.learner.current_lr
-        dense_loss = stats.get('value_heads/dense_loss', 0)
-        sparse_loss = stats.get('value_heads/sparse_loss', 0)
-        dense_samples = stats.get('value_heads/dense_samples', 0)
-        sparse_samples = stats.get('value_heads/sparse_samples', 0)
         print(f"[{update_count}] {self.total_steps / 1e6:.1f}M | {sps / 1e3:.0f}k sps | LR:{lr:.1e} | Loss:{stats.get('loss/total', 0):.3f}")
-        print(f"  VH[Dense:{dense_loss:.3f}({dense_samples}) Sparse:{sparse_loss:.3f}({sparse_samples})]")
-        print(f"Mastered: {fmt_range(mastered)} | Learned: {fmt_range(learned)}")
-        if sample_probs:
-            top_probs = sorted(sample_probs.items(), key=lambda x: -x[1])[:5]
-            print(f"Sample: {' '.join([f'S{sid}:{p:.0%}' for sid, p in top_probs if p > 0.01])}")
+        print(f"Mastered: {sorted(mastered)} | Learned: {sorted(learned)}")
         if stage_stats:
             frontier = []
             for sid in sorted(curriculum_stats.get('unlocked_stages', [0])):
@@ -1455,22 +1436,9 @@ class IMPALATrainer:
             print(f"{' | '.join(frontier)}")
         if self.writer:
             self.writer.add_scalar('train/lr', lr, self.total_steps)
-            self.writer.add_scalar('vtrace/rho_mean', stats.get('vtrace/rho_mean', 1.0), self.total_steps)
-            self.writer.add_scalar('value_heads/dense_samples', dense_samples, self.total_steps)
-            self.writer.add_scalar('value_heads/sparse_samples', sparse_samples, self.total_steps)
-            if dense_loss > 0:
-                self.writer.add_scalar('value_heads/dense_loss', dense_loss, self.total_steps)
-            if sparse_loss > 0:
-                self.writer.add_scalar('value_heads/sparse_loss', sparse_loss, self.total_steps)
-            total_samples = dense_samples + sparse_samples
-            if total_samples > 0:
-                self.writer.add_scalar('value_heads/sparse_ratio', sparse_samples / total_samples, self.total_steps)
-        if self.learner.feature_importance_history:
-            top_groups = sorted([(g, np.mean(v[-10:]) if v else 0) for g, v in self.learner.feature_importance_history.items()], key=lambda x: -x[1])[:5]
-            print(f"Features: {' '.join([f'{g}:{imp:.4f}' for g, imp in top_groups])}")
     def _save_checkpoint(self, update_count, final=False):
         path = self.checkpoint_dir / f"checkpoint_{'final' if final else f'update_{update_count}'}.pt"
-        self.learner.save_checkpoint(path, extra={'total_steps': self.total_steps, 'total_episodes': self.total_episodes, 'curriculum_stats': ray.get(self.curriculum.get_stats.remote())})
+        self.learner.save_checkpoint(path, extra={'total_steps': self.total_steps, 'total_episodes': self.total_episodes, 'curriculum_stats': ray.get(self.curriculum.get_stats.remote()), 'saved_95_all': self.saved_95_all, 'saved_100_stages': list(self.saved_100_stages)})
         print(f"Saved: {path}")
     def close(self):
         if self.writer:
@@ -1481,27 +1449,26 @@ class IMPALATrainer:
             except:
                 pass
         ray.shutdown()
-
 def main():
-    RESUME_FROM = r"C:\clones\rlib_gfootball\checkpoints_hybrid\checkpoint_update_2900.pt"
-    CHECKPOINT_DIR, LOG_DIR, NUM_WORKERS = "./checkpoints_hybrid", "./logs_hybrid", 24
+    RESUME_FROM = None
+    CHECKPOINT_DIR, LOG_DIR, NUM_WORKERS = "./checkpoints_stage9", "./logs_stage9", 24
     model_config = {
         'obs_dim': OBS_DIM,
         'feature_dim': FEATURE_DIM,
         'd_model': 128,
-        'mamba_d_state': 32,
-        'mamba_layers': 6,
+        'mamba_d_state': 64,
+        'mamba_layers': 4,
         'encoder_hidden': [128],
         'policy_hidden': [128],
         'value_hidden': [128],
         'use_distributional': True,
         'dropout': 0.0,
-        'num_stages': 14,
+        'num_stages': 10,
         'segment_size': 4,
-    } 
+    }
     config = TrainingConfig(
         stages=get_default_stages(),
-        final_stage_target_win_rate=0.5,
+        final_stage_target_win_rate=0.95,
         max_steps_without_progress=100_000_000,
         num_workers=NUM_WORKERS,
         trajectory_length=128,
@@ -1533,6 +1500,5 @@ def main():
         print("\nInterrupted")
     finally:
         trainer.close()
-
 if __name__ == "__main__":
     main()
