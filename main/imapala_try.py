@@ -492,7 +492,7 @@ class MambaIMPALANet(nn.Module):
 
 
 # =============================================================================
-# V-TRACE (Sequential - korrekte Implementierung)
+# V-TRACE
 # =============================================================================
 
 def compute_vtrace(
@@ -504,14 +504,11 @@ def compute_vtrace(
     bootstrap_values: torch.Tensor,    # (B,)
     dones: torch.Tensor,               # (B, T)
     gamma: float = 0.99,
-    rho_bar: float = 1.0,
-    c_bar: float = 1.0,
+    rho_bar: float = 1.0,              # Importance sampling truncation
+    c_bar: float = 1.0,                # Trace cutting coefficient
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute V-trace targets and advantages.
-    
-    V-trace korrigiert für Off-Policy Daten durch Importance Sampling.
-    Ref: Espeholt et al. "IMPALA" (2018)
     
     Returns:
         vs: V-trace value targets (B, T)
@@ -521,26 +518,29 @@ def compute_vtrace(
     B, T = rewards.shape
     device = rewards.device
     
-    # Importance sampling ratios: π(a|s) / μ(a|s)
-    log_rhos = (target_log_probs - behavior_log_probs).clamp(-20, 20)
+    # Importance sampling ratios
+    log_rhos = target_log_probs - behavior_log_probs
     rhos = torch.exp(log_rhos)
     
     # Clip importance weights
     clipped_rhos = torch.clamp(rhos, max=rho_bar)
     cs = torch.clamp(rhos, max=c_bar)
     
-    not_done = 1.0 - dones
-    
-    # V(s_{t+1})
+    # Temporal difference errors
+    # δ_t = ρ_t * (r_t + γ * V(s_{t+1}) - V(s_t))
     values_t_plus_1 = torch.cat([values[:, 1:], bootstrap_values.unsqueeze(1)], dim=1)
     
-    # TD errors: δ_t = ρ_t * (r_t + γ * V(s_{t+1}) - V(s_t))
+    # Mask für Episode-Ende
+    not_done = 1.0 - dones
+    
     deltas = clipped_rhos * (rewards + gamma * values_t_plus_1 * not_done - values)
     
-    # Backward accumulation: vs - V(s) = Σ (γc)^k * δ_{t+k}
+    # V-trace targets (backward pass)
+    # v_s = V(s) + Σ_{t=s}^{T-1} γ^{t-s} (Π_{i=s}^{t-1} c_i) δ_t
     vs_minus_v = torch.zeros(B, T, device=device)
-    acc = torch.zeros(B, device=device)
     
+    # Accumulate from the end
+    acc = torch.zeros(B, device=device)
     for t in reversed(range(T)):
         acc = deltas[:, t] + gamma * cs[:, t] * acc * not_done[:, t]
         vs_minus_v[:, t] = acc
@@ -548,6 +548,7 @@ def compute_vtrace(
     vs = values + vs_minus_v
     
     # Policy gradient advantages
+    # A_t = ρ_t * (r_t + γ * v_{t+1} - V(s_t))
     vs_t_plus_1 = torch.cat([vs[:, 1:], bootstrap_values.unsqueeze(1)], dim=1)
     advantages = clipped_rhos * (rewards + gamma * vs_t_plus_1 * not_done - values)
     
@@ -738,7 +739,6 @@ class IMPALALearner:
         golden_mode: str = "top_return",  # "top_return", "wins_only", "mixed"
         device: str = "cuda",
         checkpoint_dir: str = "./checkpoints_impala",
-        resume_from: str = None,  # Path to checkpoint to resume from
         d_model: int = 128,
         d_state: int = 16,
         num_layers: int = 2,
@@ -823,10 +823,6 @@ class IMPALALearner:
         if use_golden_memory:
             print(f"  Golden Memory: capacity={golden_capacity}, ratio={golden_ratio}, mode={golden_mode}")
         print(f"  Params: {sum(p.numel() for p in self.model.parameters()):,}")
-        
-        # Load checkpoint if resuming
-        if resume_from is not None:
-            self.load_checkpoint(resume_from)
     
     def _create_optimizer(self, optimizer: str, lr: float, weight_decay: float):
         """Create optimizer based on config."""
@@ -1003,21 +999,19 @@ class IMPALALearner:
             # Update
             stats = self._update(batch)
             
-            # Stats berechnen (für Logging und 100% Check)
-            win_rate = np.mean(self.episode_wins) * 100 if self.episode_wins else 0
-            mean_return = np.mean(self.episode_returns) if self.episode_returns else 0
-            max_return = np.max(self.episode_returns) if self.episode_returns else 0
-            
             # Logging
             if self.update_count % log_interval == 0:
                 elapsed = time.time() - self.start_time
                 sps = self.total_steps / elapsed if elapsed > 0 else 0
                 
+                win_rate = np.mean(self.episode_wins) * 100 if self.episode_wins else 0
+                mean_return = np.mean(self.episode_returns) if self.episode_returns else 0
+                mean_step_reward = np.mean(self.recent_rewards) if self.recent_rewards else 0
+                
                 print(f"[{self.update_count:4d}] {self.total_steps/1e6:.2f}M | "
                       f"{sps/1e3:.1f}k sps | "
                       f"Win: {win_rate:.1f}% | "
                       f"Ret: {mean_return:.2f} | "
-                      f"Max: {max_return:.2f} | "
                       f"Loss: {stats['loss']:.3f} | "
                       f"Ent: {stats['entropy']:.3f} | "
                       f"ρ: {stats['mean_rho']:.2f}" + 
@@ -1026,19 +1020,12 @@ class IMPALALearner:
             # Checkpoint
             if self.update_count % checkpoint_interval == 0:
                 self._save_checkpoint()
-            
-            # Stop bei 100% Win Rate
-            if win_rate == 100.0 and len(self.episode_wins) >= 10:
-                print(f"\n🎉 100% Win Rate erreicht nach {self.total_steps/1e6:.2f}M steps!")
-                self._save_checkpoint(name=f"perfect_{self.update_count}")
-                break
         
         self._save_checkpoint(final=True)
         print(f"\nTraining complete! Final win rate: {np.mean(self.episode_wins)*100:.1f}%")
     
-    def _save_checkpoint(self, final: bool = False, name: str = None):
-        if name is None:
-            name = "final" if final else f"update_{self.update_count}"
+    def _save_checkpoint(self, final: bool = False):
+        name = "final" if final else f"update_{self.update_count}"
         path = self.checkpoint_dir / f"checkpoint_{name}.pt"
         
         checkpoint = {
@@ -1047,10 +1034,6 @@ class IMPALALearner:
             'total_steps': self.total_steps,
             'update_count': self.update_count,
             'win_rate': np.mean(self.episode_wins) if self.episode_wins else 0,
-            'episode_returns': list(self.episode_returns),
-            'episode_wins': list(self.episode_wins),
-            'episode_lengths': list(self.episode_lengths),
-            'recent_rewards': list(self.recent_rewards),
             'config': {
                 'd_model': self.d_model,
                 'd_state': self.d_state,
@@ -1058,15 +1041,11 @@ class IMPALALearner:
                 'rho_bar': self.rho_bar,
                 'c_bar': self.c_bar,
                 'optimizer': self.optimizer_name,
-                'lr': self.lr,
-                'gamma': self.gamma,
-                'entropy_coeff': self.entropy_coeff,
-                'value_coeff': self.value_coeff,
             }
         }
         
         # Save Golden Memory
-        if self.use_golden_memory and self.golden_memory is not None:
+        if self.use_golden_memory:
             checkpoint['golden_memory'] = {
                 'buffer': self.golden_memory.buffer,
                 'returns': self.golden_memory.returns,
@@ -1076,83 +1055,16 @@ class IMPALALearner:
         torch.save(checkpoint, path)
         print(f"  Saved: {path}")
     
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint and restore training state."""
-        path = Path(checkpoint_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        
-        print(f"Loading checkpoint: {path}")
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        
-        # Load model weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load optimizer state with proper device mapping
-        if 'optimizer_state_dict' in checkpoint:
-            opt_state = checkpoint['optimizer_state_dict']
-            
-            # Move optimizer state tensors to correct device
-            for state in opt_state['state'].values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(self.device)
-            
-            self.optimizer.load_state_dict(opt_state)
-            print(f"  Restored optimizer state (Adam momentum/variance buffers)")
-        
-        # Restore training state
-        self.total_steps = checkpoint.get('total_steps', 0)
-        self.update_count = checkpoint.get('update_count', 0)
-        
-        # Restore episode stats
-        if 'episode_returns' in checkpoint:
-            self.episode_returns = deque(checkpoint['episode_returns'], maxlen=100)
-        if 'episode_wins' in checkpoint:
-            self.episode_wins = deque(checkpoint['episode_wins'], maxlen=100)
-        if 'episode_lengths' in checkpoint:
-            self.episode_lengths = deque(checkpoint['episode_lengths'], maxlen=100)
-        if 'recent_rewards' in checkpoint:
-            self.recent_rewards = deque(checkpoint['recent_rewards'], maxlen=1000)
-        
-        # Restore Golden Memory (optional - kann instabil sein nach Resume)
-        if self.use_golden_memory and 'golden_memory' in checkpoint:
-            # WICHTIG: Golden Memory enthält alte behavior_log_probs die nicht mehr
-            # zur aktuellen Policy passen. Das kann Training destabilisieren.
-            # Option 1: Clearen (sicherer)
-            # Option 2: Laden (riskant, aber schneller warmup)
-            
-            CLEAR_GOLDEN_ON_RESUME = True  # Auf False setzen wenn du es behalten willst
-            
-            if CLEAR_GOLDEN_ON_RESUME:
-                self.golden_memory.buffer = []
-                self.golden_memory.returns = []
-                print(f"  Golden Memory CLEARED (alte behavior_log_probs inkompatibel)")
-            else:
-                gm_data = checkpoint['golden_memory']
-                self.golden_memory.buffer = gm_data.get('buffer', [])
-                self.golden_memory.returns = gm_data.get('returns', [])
-                print(f"  ⚠️ Restored Golden Memory: {len(self.golden_memory)} rollouts (VORSICHT: alte log_probs!)")
-        
-        # Print restored state
-        win_rate = checkpoint.get('win_rate', 0) * 100
-        print(f"  Restored: {self.total_steps/1e6:.2f}M steps, {self.update_count} updates, {win_rate:.1f}% win rate")
-        
-        return checkpoint
-    
     def close(self):
-        # Cancel pending (ohne force für actor tasks)
-        for ref in list(self.pending_rollouts.keys()):
-            try:
-                ray.cancel(ref)
-            except Exception:
-                pass
+        # Cancel pending
+        for ref in self.pending_rollouts.keys():
+            ray.cancel(ref, force=True)
         
         # Close workers
         for w in self.workers:
             try:
                 ray.get(w.close.remote(), timeout=5)
-            except Exception:
+            except:
                 pass
         
         ray.shutdown()
@@ -1163,11 +1075,6 @@ class IMPALALearner:
 # =============================================================================
 
 def main():
-    # =========================================================================
-    # CONFIG - Hier anpassen!
-    # =========================================================================
-    RESUME_FROM = None  # Pfad zum Checkpoint, z.B. "./checkpoints_impala/checkpoint_update_500.pt"
-    
     learner = IMPALALearner(
         num_workers=24,
         num_agents=1,
@@ -1189,9 +1096,8 @@ def main():
         golden_mode="top_return",  # "top_return", "wins_only", "mixed"
         device="cuda",
         checkpoint_dir="./checkpoints_impala",
-        resume_from=RESUME_FROM,  # Checkpoint zum Weitermachen
         d_model=128,
-        d_state=64,
+        d_state=16,
         num_layers=2,
     )
     
