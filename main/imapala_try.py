@@ -498,36 +498,6 @@ class MultiAgentMambaNet(nn.Module):
         values = self.value_head(x)  # Denormalized values
         return logits, values, new_hidden
 
-    def forward_sequence_normalized(self, obs: torch.Tensor, features: torch.Tensor, agent_ids: torch.Tensor,
-                                    prev_actions: torch.Tensor, hidden: Optional[List[torch.Tensor]] = None
-                                    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """Returns normalized values (for training with PopArt)"""
-        B, L, _ = obs.shape
-        device = obs.device
-        if hidden is None:
-            hidden = self.get_initial_hidden(B, device)
-        if agent_ids.dim() == 1:
-            agent_ids_expanded = agent_ids.unsqueeze(1).expand(-1, L)
-        else:
-            agent_ids_expanded = agent_ids
-        if prev_actions.dim() == 1:
-            prev_actions_expanded = prev_actions.unsqueeze(1).expand(-1, L)
-        else:
-            prev_actions_expanded = prev_actions
-        role = self.role_encoding[agent_ids_expanded]
-        agent_embed = self.agent_embedding(agent_ids_expanded)
-        action_embed = self.action_embedding(prev_actions_expanded)
-        x = torch.cat([obs, features, role, agent_embed, action_embed], dim=-1)
-        x = self.input_proj(x)
-        new_hidden = []
-        for i, layer in enumerate(self.mamba_layers):
-            x, h_new = layer(x, hidden[i])
-            new_hidden.append(h_new)
-        x = self.final_norm(x)
-        logits = self.policy_head(x)
-        values_normalized = self.value_head.forward_normalized(x)  # Normalized values for training
-        return logits, values_normalized, new_hidden
-
     def forward(self, obs: torch.Tensor, features: torch.Tensor, agent_ids: torch.Tensor,
                 prev_actions: torch.Tensor, hidden: Optional[List[torch.Tensor]] = None
                 ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
@@ -808,16 +778,13 @@ class MultiAgentIMPALALearner:
 
     def _compute_target_log_probs(self, obs: torch.Tensor, features: torch.Tensor, agent_ids: torch.Tensor,
                                   prev_actions: torch.Tensor, actions: torch.Tensor
-                                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns log_probs, denormalized values (for V-trace), normalized values (for training), entropy"""
-        # Single forward pass - get normalized values, then denormalize for V-trace
-        logits, values_norm, _ = self.model.forward_sequence_normalized(obs, features, agent_ids, prev_actions, hidden=None)
-        # Denormalize for V-trace computation
-        values_denorm = values_norm * self.model.value_head.sigma + self.model.value_head.mu
+                                  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns log_probs, denormalized values (for V-trace), entropy"""
+        logits, values_denorm, _ = self.model.forward_sequence(obs, features, agent_ids, prev_actions, hidden=None)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
-        return log_probs, values_denorm, values_norm, entropy
+        return log_probs, values_denorm, entropy
 
     def _update(self, rollouts: List[dict]) -> dict:
         B = len(rollouts)
@@ -851,8 +818,8 @@ class MultiAgentIMPALALearner:
         bootstrap_vals = bootstrap_vals.reshape(B * N)
         agent_ids = self.agent_ids.repeat(B)
         
-        # Get log_probs, denormalized values (for V-trace), normalized values (for loss), entropy
-        target_log_probs, values_denorm, values_norm, entropy = self._compute_target_log_probs(
+        # Get log_probs, denormalized values (for V-trace), entropy
+        target_log_probs, values_denorm, entropy = self._compute_target_log_probs(
             obs, features, agent_ids, prev_actions, actions
         )
         
@@ -863,11 +830,13 @@ class MultiAgentIMPALALearner:
                 rewards=rewards, values=values_denorm.detach(), bootstrap_values=bootstrap_vals,
                 dones=dones, gamma=self.gamma, rho_bar=self.rho_bar, c_bar=self.c_bar)
             
-            # Update PopArt statistics with V-trace targets (before normalization)
+            # Update PopArt statistics with V-trace targets
             self.model.value_head.update_stats(vs)
             
-            # Normalize V-trace targets for loss computation
+            # Re-normalize BOTH targets and predictions with NEW statistics
+            # This ensures consistency after PopArt weight adjustment
             vs_normalized = self.model.value_head.normalize_targets(vs)
+            values_normalized = self.model.value_head.normalize_targets(values_denorm)
             
             # Normalize advantages for policy gradient
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -875,8 +844,8 @@ class MultiAgentIMPALALearner:
         # Policy loss
         policy_loss = -(target_log_probs * advantages.detach()).mean()
         
-        # Value loss: MSE between normalized predictions and normalized targets
-        value_loss = F.mse_loss(values_norm, vs_normalized.detach())
+        # Value loss: both sides normalized with same (updated) statistics
+        value_loss = F.mse_loss(values_normalized, vs_normalized.detach())
         entropy_loss = -entropy.mean()
         loss = policy_loss + self.value_coeff * value_loss + self.entropy_coeff * entropy_loss
         self.optimizer.zero_grad()
