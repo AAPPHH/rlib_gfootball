@@ -1,7 +1,7 @@
 import time
 from pathlib import Path
 from collections import deque
-from typing import List
+from typing import List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -300,11 +300,100 @@ class PopArtValueHead(nn.Module):
         )
 
 
-class Net(nn.Module):
-    def __init__(self, d_model: int = 128, lstm_hidden: int = 128):
+class SoftClamp(nn.Module):
+    """Soft Clipping with preserved gradients using tanh."""
+    def __init__(self, min_val: float, max_val: float):
+        super().__init__()
+        self.min_val = min_val
+        self.max_val = max_val
+        self.range = (max_val - min_val) / 2
+        self.center = (max_val + min_val) / 2
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # tanh-based soft clipping: gradients are preserved!
+        return self.center + self.range * torch.tanh((x - self.center) / self.range)
+
+
+class MambaBlock(nn.Module):
+    """Mamba selective state space block with numerical stability."""
+    def __init__(self, d_model: int, d_state: int = 16, dropout: float = 0.0):
         super().__init__()
         self.d_model = d_model
-        self.lstm_hidden = lstm_hidden
+        self.d_state = d_state
+        
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, d_model * 2, bias=False)
+        self.dt_proj = nn.Linear(d_model, d_model, bias=True)
+        
+        # A_log with bounded initialization
+        self.A_log_diag = nn.Parameter(torch.log(torch.linspace(1.0, d_state, d_state)).clamp(max=2.0))
+        
+        self.B_proj = nn.Linear(d_model, d_state, bias=False)
+        self.C_proj = nn.Linear(d_model, d_state, bias=False)
+        self.D = nn.Parameter(torch.ones(d_model))
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Soft clamps for numerical stability
+        self.dt_clamp = SoftClamp(1e-4, 0.5)
+        self.h_clamp = SoftClamp(-10.0, 10.0)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.in_proj.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.B_proj.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.C_proj.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
+        
+        # dt_proj: small weights and bias so softplus outputs small values
+        nn.init.normal_(self.dt_proj.weight, std=0.001)
+        nn.init.constant_(self.dt_proj.bias, -4.6)  # softplus(-4.6) ≈ 0.01
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = x.shape
+        
+        x_norm = self.norm(x)
+        xz = self.in_proj(x_norm)
+        x_in, z = xz.chunk(2, dim=-1)
+        
+        # dt with soft clamp for stability
+        dt = self.dt_clamp(F.softplus(self.dt_proj(x_in)))
+        
+        B_t = self.B_proj(x_in)
+        C_t = self.C_proj(x_in)
+        
+        # A with bounded range
+        A_diag = -torch.exp(self.A_log_diag.clamp(max=2.0))
+        
+        outputs = []
+        for t in range(L):
+            # Discretization
+            dt_t = dt[:, t, :].unsqueeze(-1)  # [B, D, 1]
+            dA = torch.exp(dt_t * A_diag.unsqueeze(0).unsqueeze(0))  # [B, D, d_state]
+            dB = dt_t * B_t[:, t, :].unsqueeze(1)  # [B, D, d_state]
+            
+            # State update with soft clamp
+            h = h * dA + x_in[:, t, :].unsqueeze(-1) * dB
+            h = self.h_clamp(h)  # Prevent explosion
+            
+            # Output
+            y_t = (h * C_t[:, t, :].unsqueeze(1)).sum(dim=-1)
+            outputs.append(y_t)
+        
+        y = torch.stack(outputs, dim=1)
+        out = y * F.silu(z) + x_in * self.D
+        out = x + self.dropout(self.out_proj(out))
+        
+        return out, h
+
+
+class Net(nn.Module):
+    def __init__(self, d_model: int = 128, d_state: int = 32, num_layers: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.num_layers = num_layers
         
         self.action_emb = nn.Embedding(NUM_ACTIONS + 1, 16)
         
@@ -318,29 +407,34 @@ class Net(nn.Module):
             nn.ReLU(),
         )
         
-        self.lstm = nn.LSTM(d_model, lstm_hidden, num_layers=1, batch_first=True)
+        # Mamba layers
+        self.mamba_layers = nn.ModuleList([
+            MambaBlock(d_model, d_state, dropout) for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(d_model)
         
         self.policy = nn.Sequential(
-            nn.Linear(lstm_hidden, 128),
+            nn.Linear(d_model, 128),
             nn.ReLU(),
             nn.Linear(128, NUM_ACTIONS)
         )
-        self.value = PopArtValueHead(lstm_hidden)
+        self.value = PopArtValueHead(d_model)
         
         self._init()
-        print(f"Net: {sum(p.numel() for p in self.parameters()):,} params")
+        print(f"Net (Mamba): {sum(p.numel() for p in self.parameters()):,} params")
 
     def _init(self):
-        for m in self.modules():
+        for m in self.encoder:
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.policy[-1].weight, gain=0.01)
 
-    def init_hidden(self, batch_size, device):
-        return (torch.zeros(1, batch_size, self.lstm_hidden, device=device),
-                torch.zeros(1, batch_size, self.lstm_hidden, device=device))
+    def init_hidden(self, batch_size: int, device: torch.device) -> List[torch.Tensor]:
+        """Initialize hidden state for all Mamba layers."""
+        return [torch.zeros(batch_size, self.d_model, self.d_state, device=device) 
+                for _ in range(self.num_layers)]
 
     def forward(self, obs, feat, prev_actions=None, hidden=None):
         squeeze = obs.dim() == 2
@@ -359,14 +453,20 @@ class Net(nn.Module):
         
         if hidden is None:
             hidden = self.init_hidden(B, obs.device)
-        x, hidden = self.lstm(x, hidden)
+        
+        new_hidden = []
+        for i, layer in enumerate(self.mamba_layers):
+            x, h_new = layer(x, hidden[i])
+            new_hidden.append(h_new)
+        
+        x = self.final_norm(x)
         
         logits = self.policy(x)
         values_norm = self.value(x)
         
         if squeeze:
             logits, values_norm = logits.squeeze(1), values_norm.squeeze(1)
-        return logits, values_norm, hidden
+        return logits, values_norm, new_hidden
 
     def get_action(self, obs, feat, prev_actions, hidden=None):
         logits, values_norm, hidden = self.forward(obs, feat, prev_actions, hidden)
@@ -399,7 +499,7 @@ def vtrace(behavior_lp, target_lp, rewards, values, bootstrap, dones, gamma=0.99
 
 @ray.remote(num_cpus=1)
 class Worker:
-    def __init__(self, wid, d_model, lstm_hidden, rollout_len, env_name, reward_type="scoring"):
+    def __init__(self, wid, d_model, d_state, num_layers, rollout_len, env_name, reward_type="scoring"):
         self.wid = wid
         self.rollout_len = rollout_len
         self.feat_eng = FeatureEngineer()
@@ -412,7 +512,7 @@ class Worker:
             rewards=reward_type,
             render=False
         )
-        self.model = Net(d_model, lstm_hidden)
+        self.model = Net(d_model, d_state, num_layers)
         self.model.eval()
         self._reset()
 
@@ -497,7 +597,7 @@ class Worker:
 class Learner:
     def __init__(self, num_workers=24, rollout_len=128, batch_size=32,
                  lr=5e-4, gamma=0.997, entropy_coeff=0.005, value_coeff=0.5, sil_coeff=0.5,
-                 d_model=128, lstm_hidden=128, env_name="11_vs_11_easy_stochastic",
+                 d_model=128, d_state=32, num_layers=2, env_name="11_vs_11_easy_stochastic",
                  checkpoint_dir="./checkpoints", reward_type="scoring",
                  expert_parquet=None, warmstart_path=None):
         
@@ -509,7 +609,11 @@ class Learner:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         
-        self.model = Net(d_model, lstm_hidden).to(self.device)
+        self.d_model = d_model
+        self.d_state = d_state
+        self.num_layers = num_layers
+        
+        self.model = Net(d_model, d_state, num_layers).to(self.device)
         
         if warmstart_path and Path(warmstart_path).exists():
             print(f"Loading warmstart from {warmstart_path}...")
@@ -524,7 +628,7 @@ class Learner:
         self.golden = GoldenMemory(capacity=batch_size * 8, max_uses=8)
         
         ray.init(ignore_reinit_error=True, num_cpus=num_workers + 4)
-        self.workers = [Worker.remote(i, d_model, lstm_hidden, rollout_len, env_name, reward_type)
+        self.workers = [Worker.remote(i, d_model, d_state, num_layers, rollout_len, env_name, reward_type)
                         for i in range(num_workers)]
         
         self.total_steps, self.updates, self.start = 0, 0, None
@@ -534,8 +638,9 @@ class Learner:
         
         samples = batch_size * rollout_len
         print(f"\n{'='*70}")
-        print(f"IMPALA + SIL (1-Agent) | {self.device} | {num_workers}W")
+        print(f"IMPALA + SIL (Mamba) | {self.device} | {num_workers}W")
         print(f"Batch: {batch_size} x {rollout_len} = {samples:,} samples/update")
+        print(f"Model: d_model={d_model}, d_state={d_state}, layers={num_layers}")
         print(f"LR: {lr} | γ: {gamma} | Ent: {entropy_coeff} | Val: {value_coeff} | SIL: {sil_coeff}")
         print(f"Rewards: {reward_type}")
         print(f"Expert Buffer: {len(self.expert)} rollouts" if self.expert else "Expert Buffer: None")
@@ -722,7 +827,12 @@ class Learner:
             'opt': self.optimizer.state_dict(),
             'steps': self.total_steps,
             'updates': self.updates,
-            'wr': np.mean(self.wins) if self.wins else 0
+            'wr': np.mean(self.wins) if self.wins else 0,
+            'config': {
+                'd_model': self.d_model,
+                'd_state': self.d_state,
+                'num_layers': self.num_layers,
+            }
         }, path)
         print(f"  Saved {path}")
 
@@ -748,18 +858,20 @@ if __name__ == "__main__":
         
         rollout_len=512,
         batch_size=64,
-        lr=0.0005,
+        lr=0.00001,
         gamma=0.9997,
         entropy_coeff=0.01,
         value_coeff=0.5,
         sil_coeff=0.5,
         
+        # Mamba config
         d_model=128,
-        lstm_hidden=128,
+        d_state=32,
+        num_layers=2,
         
-        checkpoint_dir="./checkpoints_1agent",
+        checkpoint_dir="./checkpoints_mamba",
         expert_parquet=r"C:\clones\rlib_gfootball\main\expert.parquet",
-        warmstart_path=r"C:\clones\rlib_gfootball\checkpoints_1agent\ckpt_u3500.pt",
+        warmstart_path=r"C:\clones\rlib_gfootball\main\bc_mamba_warmstart.pt",
     )
     
     try:
