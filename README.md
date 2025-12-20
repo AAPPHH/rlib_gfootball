@@ -77,28 +77,10 @@ A high-performance reinforcement learning system for Google Research Football th
 
 ## 📦 Installation
 
-```bash
-# Create conda environment
-conda create -n grf python=3.10
-conda activate grf
-
-# Install Google Research Football
-pip install gfootball
-
-# Install dependencies
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install ray[default] trueskill pyarrow numpy
-
-# Clone repository
-git clone https://github.com/yourusername/grf-league.git
-cd grf-league
-```
 
 ## 🚀 Usage
 
 ### Training from Scratch
-```python
-from impala_league import LeagueLearner
 
 learner = LeagueLearner(
     num_workers=32,
