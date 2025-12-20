@@ -431,6 +431,7 @@ class SelfPlayWorker:
         self.opponent_model, self.opponent_type = None, None
         self.env, self.current_env_key = None, None
         self.obs, self.feat, self.ep_ret, self.ep_len, self.prev_act, self.hidden = None, None, 0.0, 0, None, None
+        self.ep_score = [0, 0]
         self.opp_obs, self.opp_feat, self.opp_prev_act, self.opp_hidden = None, None, None, None
     def set_weights(self, weights: dict):
         self.model.load_state_dict({k: torch.from_numpy(v.copy()) for k, v in weights.items()})
@@ -445,15 +446,21 @@ class SelfPlayWorker:
             if prev_type != "snapshot":
                 self.opp_prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
                 self.opp_hidden = None
-    def _create_env(self, env_name: str, left: int, right: int) -> bool:
+    def _create_env(self, env_name: str, left: int, right: int) -> Tuple[bool, Optional[dict]]:
         env_key = (env_name, left, right)
         if self.current_env_key == env_key:
-            return False
-        if self.env is not None:
+            return False, None
+        partial_ep = None
+        if self.env is not None and self.ep_len > 0:
+            won = self.ep_score[0] > self.ep_score[1]
+            drawn = self.ep_score[0] == self.ep_score[1]
+            partial_ep = {'return': self.ep_ret, 'won': won, 'drawn': drawn, 'length': self.ep_len, 'partial': True}
+            self.env.close()
+        elif self.env is not None:
             self.env.close()
         self.env = football_env.create_environment(env_name=env_name, representation="simple115v2", number_of_left_players_agent_controls=left, number_of_right_players_agent_controls=right, rewards="scoring", render=False)
         self.current_env_key = env_key
-        return True
+        return True, partial_ep
     def _reset(self):
         raw_obs = self.env.reset()
         _, left, right = self.current_env_key
@@ -473,6 +480,7 @@ class SelfPlayWorker:
             self.obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
             self.feat = self.feat_eng.extract(self.obs)
         self.ep_ret, self.ep_len = 0.0, 0
+        self.ep_score = [0, 0]
         self.prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
         self.hidden = self.model.init_hidden(1, torch.device('cpu'))
     def _get_opponent_action(self) -> Optional[int]:
@@ -488,13 +496,17 @@ class SelfPlayWorker:
         return None
     def collect(self, env_config: Tuple[str, int, int], opponent_type: str, opponent_weights: dict = None) -> dict:
         env_name, left, right = env_config
+        prev_opponent = self.opponent_type
         self.set_opponent(opponent_type, opponent_weights)
-        env_changed = self._create_env(env_name, left, right)
+        env_changed, partial_ep = self._create_env(env_name, left, right)
         if env_changed or self.obs is None:
             self._reset()
         is_selfplay = right > 0
         data = {k: [] for k in ['obs', 'feat', 'prev_act', 'act', 'lp', 'rew', 'done']}
         episodes = []
+        if partial_ep and prev_opponent:
+            partial_ep['opponent'] = prev_opponent
+            episodes.append(partial_ep)
         for _ in range(self.rollout_len):
             with torch.no_grad():
                 act, lp, _, self.hidden = self.model.get_action(torch.from_numpy(self.obs).float().unsqueeze(0), torch.from_numpy(self.feat).float().unsqueeze(0), self.prev_act, self.hidden)
@@ -513,20 +525,17 @@ class SelfPlayWorker:
             rew = float(rew[0]) if isinstance(rew, (list, np.ndarray)) else float(rew)
             done = done[0] if isinstance(done, (list, np.ndarray)) else done
             self.ep_ret += rew
+            if rew > 0.5:
+                self.ep_score[0] += 1
+            elif rew < -0.5:
+                self.ep_score[1] += 1
             self.ep_len += 1
             ep_done = bool(done) or self.ep_len >= 3000
             data['rew'].append(rew)
             data['done'].append(float(ep_done))
             if ep_done:
-                score = None
-                if isinstance(info, dict) and 'score' in info:
-                    score = info['score']
-                elif isinstance(info, list) and len(info) > 0 and isinstance(info[0], dict) and 'score' in info[0]:
-                    score = info[0]['score']
-                if score is not None:
-                    won, drawn = score[0] > score[1], score[0] == score[1]
-                else:
-                    won, drawn = self.ep_ret > 0, abs(self.ep_ret) < 0.01
+                won = self.ep_score[0] > self.ep_score[1]
+                drawn = self.ep_score[0] == self.ep_score[1]
                 episodes.append({'return': self.ep_ret, 'won': won, 'drawn': drawn, 'length': self.ep_len, 'opponent': opponent_type})
                 self._reset()
             else:
