@@ -41,11 +41,18 @@ class PoolMember:
         return self.wins / max(1, self.games_played)
 
 class PolicyPool:
-    def __init__(self, checkpoint_dir: Path, max_snapshots: int = 10):
+    def __init__(self, checkpoint_dir: Path, max_snapshots: int = 10, keep_top_n: int = 5, active_zone_size: int = 8, temperature: float = 0.7, champion_prob: float = 0.10, exploration_prob: float = 0.05):
         self.checkpoint_dir = checkpoint_dir
         self.max_snapshots = max_snapshots
+        self.keep_top_n = keep_top_n
+        self.active_zone_size = active_zone_size
+        self.temperature = temperature
+        self.champion_prob = champion_prob
+        self.exploration_prob = exploration_prob
         self.members: Dict[str, PoolMember] = {}
         self.wr_vs: Dict[str, deque] = {}
+        self.champion: Optional[str] = None
+        self.protected: set = set()
         self._init_anchors()
 
     def _init_anchors(self):
@@ -57,45 +64,68 @@ class PolicyPool:
         for name in self.members:
             self.wr_vs[name] = deque(maxlen=100)
 
-    def add_snapshot(self, name: str, weights_path: str, rating: trueskill.Rating):
+    def _conservative_skill(self, member: PoolMember) -> float:
+        return member.rating.mu - 3 * member.rating.sigma
+
+    def _update_champion(self):
+        best_name, best_skill = None, -np.inf
+        for name, member in self.members.items():
+            if member.policy_type != "checkpoint":
+                continue
+            skill = self._conservative_skill(member)
+            if skill > best_skill:
+                best_skill = skill
+                best_name = name
+        if best_name:
+            self.champion = best_name
+            self.protected.add(best_name)
+
+    def _auto_prune(self):
         snapshots = [m for m in self.members.values() if m.policy_type == "checkpoint"]
-        if len(snapshots) >= self.max_snapshots:
-            weakest = min(snapshots, key=lambda m: m.rating.mu)
-            del self.members[weakest.name]
-            if weakest.name in self.wr_vs:
-                del self.wr_vs[weakest.name]
+        if len(snapshots) <= self.max_snapshots:
+            return
+        keep = set(self.protected)
+        by_skill = sorted(snapshots, key=lambda m: self._conservative_skill(m), reverse=True)
+        for m in by_skill[:self.keep_top_n]:
+            keep.add(m.name)
+        by_games = sorted(snapshots, key=lambda m: m.games_played, reverse=True)
+        for m in by_games[:self.active_zone_size]:
+            keep.add(m.name)
+        for m in snapshots:
+            if m.name not in keep:
+                if m.weights_path:
+                    Path(m.weights_path).unlink(missing_ok=True)
+                del self.members[m.name]
+                if m.name in self.wr_vs:
+                    del self.wr_vs[m.name]
+                if m.name in self.protected:
+                    self.protected.discard(m.name)
+
+    def add_snapshot(self, name: str, weights_path: str, rating: trueskill.Rating):
         self.members[name] = PoolMember(name=name, policy_type="checkpoint", rating=TS_ENV.create_rating(mu=rating.mu, sigma=rating.sigma), frozen=False, weights_path=weights_path)
         self.wr_vs[name] = deque(maxlen=100)
+        self._update_champion()
+        self._auto_prune()
 
     def sample_opponent(self, current_rating: trueskill.Rating, force_bot: str = None) -> str:
         if force_bot and force_bot in self.members:
             return force_bot
-        weights = {}
+        candidates = []
+        qualities = []
         for name, member in self.members.items():
-            if len(self.wr_vs[name]) >= 10:
-                wr = np.mean(list(self.wr_vs[name]))
-            else:
-                wr = ts_win_probability(current_rating, member.rating)
-            if wr < 0.1:
-                weight = 0.05
-            elif wr < 0.3:
-                weight = 0.1 + (wr - 0.1) * 2
-            elif wr < 0.7:
-                weight = 0.5
-            elif wr < 0.9:
-                weight = 0.5 - (wr - 0.7) * 2
-            else:
-                weight = 0.05
-            if member.policy_type in ["random", "lazy"]:
-                weight = max(weight, 0.03)
-            if member.policy_type.startswith("bot_"):
-                weight = max(weight, 0.08)
-            weights[name] = weight
-        total = sum(weights.values())
-        probs = {k: v / total for k, v in weights.items()}
-        names = list(probs.keys())
-        p = [probs[n] for n in names]
-        return np.random.choice(names, p=p)
+            q = trueskill.quality_1vs1(current_rating, member.rating)
+            candidates.append(name)
+            qualities.append(q)
+        qualities = np.array(qualities)
+        weights = np.power(qualities + 1e-6, self.temperature)
+        probs = weights / weights.sum()
+        min_prob = self.exploration_prob / len(probs)
+        probs = (1.0 - self.exploration_prob - self.champion_prob) * probs + min_prob
+        if self.champion and self.champion in candidates:
+            champ_idx = candidates.index(self.champion)
+            probs[champ_idx] += self.champion_prob
+        probs = probs / probs.sum()
+        return np.random.choice(candidates, p=probs)
 
     def report_game(self, opponent_name: str, current_rating: trueskill.Rating, won: bool, drawn: bool = False) -> Tuple[trueskill.Rating, trueskill.Rating]:
         member = self.members[opponent_name]
@@ -110,6 +140,7 @@ class PolicyPool:
             member.wins += 1
         if not member.frozen:
             member.rating = new_opponent
+        self._update_champion()
         return new_current, member.rating
 
     def get_rating_gaps(self, current_rating: trueskill.Rating) -> Dict[str, float]:
@@ -123,13 +154,17 @@ class PolicyPool:
         return {
             'num_members': len(self.members),
             'num_snapshots': sum(1 for m in self.members.values() if m.policy_type == "checkpoint"),
+            'champion': self.champion,
+            'protected': len(self.protected),
             'members': {name: {'type': m.policy_type, 'mu': m.rating.mu, 'sigma': m.rating.sigma, 'games': m.games_played, 'wr_against': np.mean(list(self.wr_vs[name])) if self.wr_vs[name] else 0.5} for name, m in self.members.items()}
         }
 
     def save(self, path: Path):
         state = {
             'members': {name: {'name': m.name, 'policy_type': m.policy_type, 'rating_mu': m.rating.mu, 'rating_sigma': m.rating.sigma, 'frozen': m.frozen, 'weights_path': m.weights_path, 'games_played': m.games_played, 'wins': m.wins} for name, m in self.members.items()},
-            'wr_vs': {name: list(wr) for name, wr in self.wr_vs.items()}
+            'wr_vs': {name: list(wr) for name, wr in self.wr_vs.items()},
+            'champion': self.champion,
+            'protected': list(self.protected)
         }
         with open(path, 'wb') as f:
             pickle.dump(state, f)
@@ -146,6 +181,8 @@ class PolicyPool:
         for name in self.members:
             if name not in self.wr_vs:
                 self.wr_vs[name] = deque(maxlen=100)
+        self.champion = state.get('champion')
+        self.protected = set(state.get('protected', []))
         return True
 
 class FeatureEngineer:
@@ -563,7 +600,7 @@ class GoldenMemory:
         self.uses = []
         self.opp_ratings = []
     def add(self, rollout: dict, ret: float, won: bool, opp_rating: float = 25.0):
-        if ret < 0.5 and not won:
+        if ret < -0.5 and not won:
             return False
         if len(self.buffer) >= self.capacity:
             worst_idx = int(np.argmin(self.returns))
@@ -614,7 +651,7 @@ class GoldenMemory:
         return len(self.buffer)
 
 class SelfPlayLearner:
-    def __init__(self, num_workers: int = 24, rollout_len: int = 512, batch_size: int = 64, lr: float = 5e-4, gamma: float = 0.997, entropy_coeff: float = 0.01, value_coeff: float = 0.5, sil_coeff: float = 0.5, d_model: int = 128, lstm_hidden: int = 128, checkpoint_dir: str = "./checkpoints_selfplay", warmstart_path: str = None, expert_parquet: str = None, snapshot_interval: int = 500, max_snapshots: int = 10):
+    def __init__(self, num_workers: int = 24, rollout_len: int = 512, batch_size: int = 64, lr: float = 5e-4, gamma: float = 0.997, entropy_coeff: float = 0.01, value_coeff: float = 0.5, sil_coeff: float = 0.5, d_model: int = 128, lstm_hidden: int = 128, checkpoint_dir: str = "./checkpoints_selfplay", warmstart_path: str = None, expert_parquet: str = None, snapshot_interval: int = 500, max_snapshots: int = 10, keep_top_n: int = 5, active_zone_size: int = 8, expert_threshold: float = 4.0):
         self.num_workers = num_workers
         self.rollout_len = rollout_len
         self.batch_size = batch_size
@@ -625,6 +662,8 @@ class SelfPlayLearner:
         self.d_model = d_model
         self.lstm_hidden = lstm_hidden
         self.snapshot_interval = snapshot_interval
+        self.expert_threshold = expert_threshold
+        self.expert_disabled = False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
@@ -639,7 +678,7 @@ class SelfPlayLearner:
         self.expert = ExpertBuffer(expert_parquet, rollout_len) if expert_parquet else None
         self.golden = GoldenMemory(capacity=batch_size * 8, max_uses=8)
         self.current_rating = TS_ENV.create_rating(mu=25.0, sigma=8.333)
-        self.pool = PolicyPool(self.checkpoint_dir, max_snapshots=max_snapshots)
+        self.pool = PolicyPool(self.checkpoint_dir, max_snapshots=max_snapshots, keep_top_n=keep_top_n, active_zone_size=active_zone_size)
         pool_path = self.checkpoint_dir / "pool.pkl"
         if pool_path.exists():
             print("Loading existing pool...")
@@ -657,6 +696,7 @@ class SelfPlayLearner:
         self.returns = deque(maxlen=100)
         self.wins = deque(maxlen=100)
         self.lengths = deque(maxlen=100)
+        self.returns_vs_hard = deque(maxlen=100)
         self.max_rew, self.min_rew = -999, 999
         self.best_rating_vs_hard = -float('inf')
         self.pending = {}
@@ -670,9 +710,9 @@ class SelfPlayLearner:
         print(f"Batch: {self.batch_size} x {self.rollout_len} = {self.batch_size * self.rollout_len:,} samples/update")
         print(f"LR: {lr} | γ: {self.gamma} | Ent: {self.entropy_coeff} | Val: {self.value_coeff} | SIL: {self.sil_coeff}")
         print(f"Snapshot interval: {self.snapshot_interval} updates")
-        print(f"Pool: {self.pool.get_stats()['num_members']} members")
+        print(f"Pool: {self.pool.get_stats()['num_members']} members | keep_top={self.pool.keep_top_n} active_zone={self.pool.active_zone_size}")
         if self.expert:
-            print(f"Expert Buffer: {len(self.expert)} rollouts")
+            print(f"Expert Buffer: {len(self.expert)} rollouts | auto-disable threshold: {self.expert_threshold}")
         print(f"Golden Memory: cap={self.batch_size * 8}")
         print(f"Current Rating: μ={self.current_rating.mu:.1f}, σ={self.current_rating.sigma:.2f}")
         print(f"{'='*70}\n")
@@ -766,17 +806,19 @@ class SelfPlayLearner:
     def _maybe_save_snapshot(self):
         if self.updates % self.snapshot_interval != 0:
             return
-        pool_ratings = [m.rating.mu for m in self.pool.members.values() if m.policy_type == "checkpoint"]
-        if pool_ratings:
-            median_rating = np.median(pool_ratings)
-            if self.current_rating.mu < median_rating:
-                return
+        snapshots = [m for m in self.pool.members.values() if m.policy_type == "checkpoint"]
+        if len(snapshots) >= self.pool.max_snapshots:
+            dominated = [m for m in snapshots if m.name not in self.pool.protected]
+            if dominated:
+                weakest = min(dominated, key=lambda m: self.pool._conservative_skill(m))
+                if self.pool._conservative_skill(PoolMember(name="", policy_type="", rating=self.current_rating)) < self.pool._conservative_skill(weakest):
+                    return
         name = f"snapshot_u{self.updates}"
         path = self.checkpoint_dir / f"{name}.pt"
         torch.save({'model': self.model.state_dict()}, path)
         rating_copy = TS_ENV.create_rating(mu=self.current_rating.mu, sigma=self.current_rating.sigma)
         self.pool.add_snapshot(name, str(path), rating_copy)
-        print(f"  📸 Saved snapshot: {name} (μ={self.current_rating.mu:.1f})")
+        print(f"  📸 Saved snapshot: {name} (μ={self.current_rating.mu:.1f}) champ={self.pool.champion}")
 
     def _log_progress(self, stats: dict, stats_exp: dict = None, stats_sil: dict = None):
         elapsed = time.time() - self.start
@@ -784,16 +826,19 @@ class SelfPlayLearner:
         wr = np.mean(list(self.wins)) * 100 if self.wins else 0
         ret = np.mean(list(self.returns)) if self.returns else 0
         ret_max = np.max(list(self.returns)) if self.returns else 0
-        gaps = self.pool.get_rating_gaps(self.current_rating)
-        gap_easy = gaps.get('bot_easy', 0)
-        gap_med = gaps.get('bot_medium', 0)
-        gap_hard = gaps.get('bot_hard', 0)
+        avg_vs_hard = np.mean(list(self.returns_vs_hard)) if len(self.returns_vs_hard) >= 10 else 0
         pool_stats = self.pool.get_stats()
         gm = self.golden.stats()
         bot_wr = self._get_bot_winrates()
-        exp_str = f"EXP L:{stats_exp['sil_loss']:.2f} p:{stats_exp['sil_pi']:.2f} v:{stats_exp['sil_v']:.2f} adv:{stats_exp['sil_adv']:.2f}({stats_exp['sil_frac']:.0%})" if stats_exp else "EXP:--"
+        if stats_exp:
+            exp_str = f"EXP L:{stats_exp['sil_loss']:.2f} p:{stats_exp['sil_pi']:.2f} v:{stats_exp['sil_v']:.2f} adv:{stats_exp['sil_adv']:.2f}({stats_exp['sil_frac']:.0%})"
+        elif self.expert_disabled:
+            exp_str = "EXP:OFF"
+        else:
+            exp_str = "EXP:--"
         sil_str = f"SIL L:{stats_sil['sil_loss']:.2f} p:{stats_sil['sil_pi']:.2f} v:{stats_sil['sil_v']:.2f} adv:{stats_sil['sil_adv']:.2f}({stats_sil['sil_frac']:.0%})" if stats_sil else "SIL:--"
-        print(f"[{self.updates:4d}] {self.total_steps/1e6:.1f}M {sps/1e3:.0f}k/s {elapsed/60:.0f}m | W:{wr:4.0f}% R:{ret:+.1f}({ret_max:+.0f}) | μ={self.current_rating.mu:.1f} σ={self.current_rating.sigma:.2f} | E:{bot_wr['easy']:2.0f}%({bot_wr['easy_n']}) M:{bot_wr['medium']:2.0f}%({bot_wr['medium_n']}) H:{bot_wr['hard']:2.0f}%({bot_wr['hard_n']}) | VT L:{stats['loss']:.2f} p:{stats['pi']:+.2f} v:{stats['v']:.2f} H:{stats['ent']:.2f} ρ:{stats['rho']:.1f}/{stats['rho_max']:.1f} | {exp_str} | {sil_str} | GM:{gm['size']}({gm['fresh']}) opp:{gm['opp_mean']:.0f} | ∇:{stats['grad']:.1f}→{stats['grad_clip']:.1f} | Pool:{pool_stats['num_snapshots']}snap")
+        champ_str = f"🏆{self.pool.champion}" if self.pool.champion else ""
+        print(f"[{self.updates:4d}] {self.total_steps/1e6:.1f}M {sps/1e3:.0f}k/s {elapsed/60:.0f}m | W:{wr:4.0f}% R:{ret:+.1f}({ret_max:+.0f}) | μ={self.current_rating.mu:.1f} σ={self.current_rating.sigma:.2f} | E:{bot_wr['easy']:2.0f}%({bot_wr['easy_n']}) M:{bot_wr['medium']:2.0f}%({bot_wr['medium_n']}) H:{bot_wr['hard']:2.0f}%({bot_wr['hard_n']}) RvH:{avg_vs_hard:+.1f} | VT L:{stats['loss']:.2f} p:{stats['pi']:+.2f} v:{stats['v']:.2f} H:{stats['ent']:.2f} ρ:{stats['rho']:.1f}/{stats['rho_max']:.1f} | {exp_str} | {sil_str} | GM:{gm['size']}({gm['fresh']}) | ∇:{stats['grad']:.1f}→{stats['grad_clip']:.1f} | Pool:{pool_stats['num_snapshots']}snap {champ_str}")
 
     def _get_bot_winrates(self) -> dict:
         result = {'easy': 0, 'medium': 0, 'hard': 0, 'easy_n': 0, 'medium_n': 0, 'hard_n': 0}
@@ -828,6 +873,8 @@ class SelfPlayLearner:
                         self.returns.append(ep['return'])
                         self.wins.append(float(ep['won']))
                         self.lengths.append(ep['length'])
+                        if opponent_name == "bot_hard":
+                            self.returns_vs_hard.append(ep['return'])
                         self.current_rating, _ = self.pool.report_game(opponent_name, self.current_rating, won=ep['won'], drawn=ep.get('drawn', False))
                     if rollout['episodes']:
                         best_ep = max(rollout['episodes'], key=lambda e: e['return'])
@@ -847,9 +894,14 @@ class SelfPlayLearner:
             stats = self._update(batch)
             self.updates += 1
             stats_exp = None
-            if self.expert and len(self.expert) >= self.batch_size // 2:
-                expert_batch = self.expert.sample(self.batch_size // 2)
-                stats_exp = self._update_sil(expert_batch)
+            if self.expert and len(self.expert) >= self.batch_size // 2 and not self.expert_disabled:
+                avg_vs_hard = np.mean(list(self.returns_vs_hard)) if len(self.returns_vs_hard) >= 20 else 0
+                if avg_vs_hard < self.expert_threshold:
+                    expert_batch = self.expert.sample(self.batch_size // 2)
+                    stats_exp = self._update_sil(expert_batch)
+                else:
+                    self.expert_disabled = True
+                    print(f"  🎓 Expert Buffer disabled (avg vs hard: {avg_vs_hard:.1f} > {self.expert_threshold})")
             stats_sil = None
             if self.golden:
                 golden_batch = self.golden.sample(min(self.batch_size // 2, len(self.golden)))
@@ -891,19 +943,22 @@ if __name__ == "__main__":
     learner = SelfPlayLearner(
         num_workers=32,
         rollout_len=512,
-        batch_size=64,
+        batch_size=128,
         lr=0.0005,
         gamma=0.997,
         entropy_coeff=0.01,
         value_coeff=0.5,
         sil_coeff=0.5,
-        d_model=128,
-        lstm_hidden=128,
+        d_model=512,
+        lstm_hidden=512,
         checkpoint_dir="./checkpoints_selfplay",
-        warmstart_path=r"C:\clones\rlib_gfootball\checkpoints_selfplay\ckpt_u2800.pt",
+        warmstart_path=r"C:\clones\rlib_gfootball\checkpoints_selfplay\ckpt_u900.pt",
         expert_parquet=r"C:\clones\rlib_gfootball\main\expert.parquet",
-        snapshot_interval=5000,
-        max_snapshots=15,
+        snapshot_interval=200,
+        max_snapshots=21,
+        keep_top_n=7,
+        active_zone_size=10,
+        expert_threshold=4.0,
     )
     try:
         learner.train(max_time=360000)

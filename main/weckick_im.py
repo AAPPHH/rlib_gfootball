@@ -142,7 +142,7 @@ class ExpertDataset(Dataset):
 
 
 class Net(nn.Module):
-    def __init__(self, d_model=128, lstm_hidden=128):
+    def __init__(self, d_model=512, lstm_hidden=512):
         super().__init__()
         self.d_model = d_model
         self.lstm_hidden = lstm_hidden
@@ -214,7 +214,7 @@ def train_bc(parquet_path, epochs=20, batch_size=512, lr=1e-3, save_path="bc_war
     
     print(f"Train: {n_train} | Val: {n_val}\n")
     
-    model = Net(d_model=128, lstm_hidden=128).to(device)
+    model = Net(d_model=512, lstm_hidden=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     print(f"{'Epoch':>5} | {'Train Loss':>10} | {'Train Acc':>9} | {'Val Loss':>10} | {'Val Acc':>9}")
