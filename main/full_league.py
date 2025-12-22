@@ -19,6 +19,7 @@ import gfootball.env as football_env
 FEATURE_DIM = 93
 OBS_DIM = 115
 NUM_ACTIONS = 19
+trueskill.setup(backend='mpmath')
 TS_ENV = trueskill.TrueSkill(mu=25.0, sigma=8.333, beta=4.166, tau=0.083, draw_probability=0.05)
 
 @dataclass
@@ -59,15 +60,13 @@ class LeagueMember:
         self.rating_history.append(self.rating.mu)
 
 class PureLeague:
-    def __init__(self, checkpoint_dir: Path, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, skill_matched_prob: float = 0.35, champion_prob: float = 0.50, exploration_prob: float = 0.15, bot_rating_factor: float = 0.3):
+    def __init__(self, checkpoint_dir: Path, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, bot_floor: float = 0.25, bot_rating_factor: float = 0.3):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.max_snapshots = max_snapshots
         self.snapshot_on_rating_gain = snapshot_on_rating_gain
         self.snapshot_on_champion_wins = snapshot_on_champion_wins
-        self.skill_matched_prob = skill_matched_prob
-        self.champion_prob = champion_prob
-        self.exploration_prob = exploration_prob
+        self.bot_floor = bot_floor
         self.bot_rating_factor = bot_rating_factor
         self.members: Dict[str, LeagueMember] = {}
         self.champion: Optional[str] = None
@@ -107,26 +106,36 @@ class PureLeague:
     def select_opponent(self, current_rating: trueskill.Rating, force_bot: str = None) -> Tuple[str, str]:
         if force_bot and force_bot in self.members:
             return force_bot, "eval"
-        cutoff = current_rating.mu - 15
-        strong = [n for n, m in self.members.items() if m.rating.mu > cutoff or m.member_type == "bot"]
-        if len(strong) < 3:
-            strong = list(self.members.keys())
-        r = np.random.random()
-        if r < self.champion_prob and self.champion:
-            return self.champion, "champion"
-        if r < self.champion_prob + self.skill_matched_prob:
-            return self._select_skill_matched(current_rating, strong)
-        return self._select_exploration(strong)
-    def _select_skill_matched(self, current_rating: trueskill.Rating, candidates: List[str]) -> Tuple[str, str]:
-        qualities = np.array([self.match_quality(current_rating, self.members[n].rating) for n in candidates])
-        weights = np.exp(qualities / 0.3)
-        probs = weights / weights.sum()
-        return np.random.choice(candidates, p=probs), "skill_matched"
-    def _select_exploration(self, candidates: List[str]) -> Tuple[str, str]:
-        games = np.array([self.members[n].games_played for n in candidates])
-        weights = 1.0 / (games + 1)
-        probs = weights / weights.sum()
-        return np.random.choice(candidates, p=probs), "exploration"
+        if np.random.random() < self.bot_floor:
+            bots = [n for n, m in self.members.items() if m.member_type == "bot"]
+            weights = []
+            for name in bots:
+                member = self.members[name]
+                if len(member.recent_results) >= 5:
+                    our_wr = 1 - member.recent_win_rate
+                    weight = (1 - our_wr) ** 0.5
+                else:
+                    weight = 0.5
+                weights.append(max(weight, 0.1))
+            probs = np.array(weights) / sum(weights)
+            return np.random.choice(bots, p=probs), "bot"
+        candidates = list(self.members.keys())
+        weights = []
+        for name in candidates:
+            member = self.members[name]
+            win_prob = self.win_probability(current_rating, member.rating)
+            if len(member.recent_results) >= 5:
+                our_wr = 1 - member.recent_win_rate
+                difficulty = (1 - win_prob) * 0.5 + (1 - our_wr) * 0.5
+            else:
+                difficulty = 0.5 + (1 - win_prob) * 0.3
+            weight = difficulty ** 0.5
+            weight = max(weight, 0.05)
+            if member.games_played < 50:
+                weight *= 1.5
+            weights.append(weight)
+        probs = np.array(weights) / sum(weights)
+        return np.random.choice(candidates, p=probs), "pfsp"
     def report_game(self, opponent_name: str, current_rating: trueskill.Rating, won: bool, drawn: bool = False) -> trueskill.Rating:
         if opponent_name not in self.members:
             return current_rating
@@ -201,7 +210,15 @@ class PureLeague:
     def get_stats(self) -> Dict:
         bots = {n: m for n, m in self.members.items() if m.member_type == "bot"}
         snaps = {n: m for n, m in self.members.items() if m.member_type == "snapshot"}
-        return {'total_games': self.total_games, 'champion': self.champion, 'champion_mu': self.members[self.champion].rating.mu if self.champion else 0, 'num_snapshots': len(snaps), 'wins_vs_champion': self.wins_vs_champion, 'bots': {n: {'mu': m.rating.mu, 'games': m.games_played, 'wr': m.recent_win_rate} for n, m in bots.items()}}
+        total = sum(m.games_played for m in self.members.values())
+        if total > 0:
+            probs = [m.games_played / total for m in self.members.values() if m.games_played > 0]
+            entropy = -sum(p * np.log(p + 1e-8) for p in probs)
+            max_entropy = np.log(len([m for m in self.members.values() if m.games_played > 0]) + 1e-8)
+            diversity = entropy / max_entropy if max_entropy > 0 else 0
+        else:
+            diversity = 0
+        return {'total_games': self.total_games, 'champion': self.champion, 'champion_mu': self.members[self.champion].rating.mu if self.champion else 0, 'num_snapshots': len(snaps), 'wins_vs_champion': self.wins_vs_champion, 'diversity': diversity, 'bots': {n: {'mu': m.rating.mu, 'games': m.games_played, 'wr': m.recent_win_rate} for n, m in bots.items()}}
     def get_ranking(self) -> List[Tuple[str, float, str]]:
         ranked = sorted(self.members.values(), key=lambda m: m.conservative_skill, reverse=True)
         return [(m.name, m.conservative_skill, m.member_type) for m in ranked]
@@ -647,7 +664,7 @@ class GoldenMemory:
         return len(self.buffer)
 
 class LeagueLearner:
-    def __init__(self, num_workers: int = 24, rollout_len: int = 512, batch_size: int = 64, lr: float = 5e-4, gamma: float = 0.997, entropy_coeff: float = 0.01, value_coeff: float = 0.5, sil_coeff: float = 0.5, d_model: int = 128, lstm_hidden: int = 128, checkpoint_dir: str = "./checkpoints_league", warmstart_path: str = None, expert_parquet: str = None, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, skill_matched_prob: float = 0.35, champion_prob: float = 0.50, exploration_prob: float = 0.15, bot_rating_factor: float = 0.3, expert_threshold: float = 0.7):
+    def __init__(self, num_workers: int = 24, rollout_len: int = 512, batch_size: int = 64, lr: float = 5e-4, gamma: float = 0.997, entropy_coeff: float = 0.01, value_coeff: float = 0.5, sil_coeff: float = 0.5, d_model: int = 128, lstm_hidden: int = 128, checkpoint_dir: str = "./checkpoints_league", warmstart_path: str = None, expert_parquet: str = None, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, bot_floor: float = 0.25, bot_rating_factor: float = 0.3, expert_threshold: float = 0.7):
         self.num_workers, self.rollout_len, self.batch_size = num_workers, rollout_len, batch_size
         self.gamma, self.entropy_coeff, self.value_coeff, self.sil_coeff = gamma, entropy_coeff, value_coeff, sil_coeff
         self.d_model, self.lstm_hidden, self.expert_threshold, self.expert_disabled = d_model, lstm_hidden, expert_threshold, False
@@ -664,7 +681,7 @@ class LeagueLearner:
         self.expert = ExpertBuffer(expert_parquet, rollout_len) if expert_parquet else None
         self.golden = GoldenMemory(capacity=batch_size * 8, max_uses=8)
         self.current_rating = TS_ENV.create_rating(mu=25.0, sigma=8.333)
-        self.league = PureLeague(checkpoint_dir=self.checkpoint_dir, max_snapshots=max_snapshots, snapshot_on_rating_gain=snapshot_on_rating_gain, snapshot_on_champion_wins=snapshot_on_champion_wins, skill_matched_prob=skill_matched_prob, champion_prob=champion_prob, exploration_prob=exploration_prob, bot_rating_factor=bot_rating_factor)
+        self.league = PureLeague(checkpoint_dir=self.checkpoint_dir, max_snapshots=max_snapshots, snapshot_on_rating_gain=snapshot_on_rating_gain, snapshot_on_champion_wins=snapshot_on_champion_wins, bot_floor=bot_floor, bot_rating_factor=bot_rating_factor)
         league_path = self.checkpoint_dir / "league.pkl"
         if league_path.exists():
             self.league.load()
@@ -684,10 +701,10 @@ class LeagueLearner:
         self._print_config(lr)
     def _print_config(self, lr):
         print(f"\n{'='*70}")
-        print(f"IMPALA + Pure League | {self.device} | {self.num_workers}W")
+        print(f"IMPALA + PFSP League | {self.device} | {self.num_workers}W")
         print(f"Batch: {self.batch_size} x {self.rollout_len} = {self.batch_size * self.rollout_len:,} samples/update")
         print(f"LR: {lr} | γ: {self.gamma} | Ent: {self.entropy_coeff} | Val: {self.value_coeff} | SIL: {self.sil_coeff}")
-        print(f"League: max_snap={self.league.max_snapshots} skill_match={self.league.skill_matched_prob:.0%} champ={self.league.champion_prob:.0%}")
+        print(f"League: max_snap={self.league.max_snapshots} bot_floor={self.league.bot_floor:.0%} (PFSP)")
         if self.expert:
             print(f"Expert Buffer: {len(self.expert)} rollouts | threshold: {self.expert_threshold}")
         print(f"Current Rating: μ={self.current_rating.mu:.1f}, σ={self.current_rating.sigma:.2f}")
@@ -783,6 +800,7 @@ class LeagueLearner:
         e_n = bot_stats.get('bot_easy', {}).get('games', 0)
         m_n = bot_stats.get('bot_medium', {}).get('games', 0)
         h_n = bot_stats.get('bot_hard', {}).get('games', 0)
+        diversity = league_stats.get('diversity', 0)
         if stats_exp:
             exp_str = f"EXP L:{stats_exp['sil_loss']:.2f} p:{stats_exp['sil_pi']:.2f} v:{stats_exp['sil_v']:.2f} adv:{stats_exp['sil_adv']:.2f}({stats_exp['sil_frac']:.0%})"
         elif self.expert_disabled:
@@ -794,7 +812,7 @@ class LeagueLearner:
         else:
             sil_str = "SIL:--"
         champ = league_stats['champion'] or "none"
-        print(f"[{self.updates:4d}] {self.total_steps/1e6:.1f}M {sps/1e3:.0f}k/s {elapsed/60:.0f}m | W:{wr:4.0f}% R:{ret:+.1f}({ret_max:+.0f}) | μ={self.current_rating.mu:.1f} σ={self.current_rating.sigma:.2f} | E:{e_wr:2.0f}%({e_n}) M:{m_wr:2.0f}%({m_n}) H:{h_wr:2.0f}%({h_n}) RvH:{avg_vs_hard:+.1f} | VT L:{stats['loss']:.2f} p:{stats['pi']:+.2f} v:{stats['v']:.2f} H:{stats['ent']:.2f} ρ:{stats['rho']:.1f}/{stats['rho_max']:.1f} | {exp_str} | {sil_str} | GM:{gm['size']}({gm['fresh']}) | ∇:{stats['grad']:.1f}→{stats['grad_clip']:.1f} | League:{league_stats['num_snapshots']}snap 🏆{champ}")
+        print(f"[{self.updates:4d}] {self.total_steps/1e6:.1f}M {sps/1e3:.0f}k/s {elapsed/60:.0f}m | W:{wr:4.0f}% R:{ret:+.1f}({ret_max:+.0f}) | μ={self.current_rating.mu:.1f} σ={self.current_rating.sigma:.2f} | E:{e_wr:2.0f}%({e_n}) M:{m_wr:2.0f}%({m_n}) H:{h_wr:2.0f}%({h_n}) RvH:{avg_vs_hard:+.1f} | VT L:{stats['loss']:.2f} p:{stats['pi']:+.2f} v:{stats['v']:.2f} H:{stats['ent']:.2f} ρ:{stats['rho']:.1f}/{stats['rho_max']:.1f} | {exp_str} | {sil_str} | GM:{gm['size']}({gm['fresh']}) | ∇:{stats['grad']:.1f}→{stats['grad_clip']:.1f} | League:{league_stats['num_snapshots']}snap DIV:{diversity:.2f} 🏆{champ}")
     def train(self, max_time: int = 3600):
         print(f"Training for {max_time}s...\n")
         self.start = time.time()
@@ -891,17 +909,16 @@ class LeagueLearner:
 
 if __name__ == "__main__":
     learner = LeagueLearner(
-        num_workers=32, rollout_len=512, batch_size=128, lr=0.0005, gamma=0.997,
+        num_workers=32, rollout_len=512, batch_size=128, lr=0.0005, gamma=0.998,
         entropy_coeff=0.01, value_coeff=0.5, sil_coeff=0.5, d_model=512, lstm_hidden=512,
-        checkpoint_dir="./checkpoints_league",
-        warmstart_path=r"C:\clones\rlib_gfootball\checkpoints_selfplay\ckpt_u900.pt",
-        expert_parquet=r"C:\clones\rlib_gfootball\main\expert.parquet",
+        checkpoint_dir="./checkpoints_league_v2",
+        warmstart_path=None,
+        expert_parquet=None,
         max_snapshots=15, snapshot_on_rating_gain=2.0, snapshot_on_champion_wins=5,
-        skill_matched_prob=0.35, champion_prob=0.50, exploration_prob=0.15,
-        bot_rating_factor=0.3, expert_threshold=0.7,
+        bot_floor=0.20, bot_rating_factor=0.3, expert_threshold=0.7,
     )
     try:
-        learner.train(max_time=360000)
+        learner.train(max_time=24*3600)
     except KeyboardInterrupt:
         print("\nStopped!")
     finally:
