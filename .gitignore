@@ -30,3 +30,6 @@
 *.pth
 *.csv
 *.pt
+*.mp4
+*.avi
+*.dump

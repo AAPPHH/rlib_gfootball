@@ -304,46 +304,70 @@ def render_episode(checkpoint_path: str, output_dir: str, d_model: int = 512,
 
 
 if __name__ == "__main__":
+    import shutil
+    
     # ============ KONFIGURATION ============
-    CHECKPOINT = r"C:\clones\rlib_gfootball\checkpoints_league\snap_u99_r105.pt"
+    CHECKPOINT = r"C:\clones\rlib_gfootball\checkpoints_selfplay\snapshot_u800.pt"
     OUTPUT_DIR = r"./videos"
     D_MODEL = 512
     LSTM_HIDDEN = 512
-    NUM_EPISODES = 1
     DETERMINISTIC = True
     RENDER_LIVE = True
+    MIN_REWARD = 2
+    TARGET_VIDEOS = 400
 
-    
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    temp_dir = output_dir / "_temp"
+    
     results = []
-    for i in range(NUM_EPISODES):
-        ep_output_dir = output_dir / f"episode_{i+1}"
+    kept = 0
+    episode = 0
+    
+    while kept < TARGET_VIDEOS:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir()
         
+        episode += 1
         print(f"\n{'='*60}")
-        print(f"Episode {i+1}/{NUM_EPISODES}")
+        print(f"Episode {episode} | Kept: {kept}/{TARGET_VIDEOS}")
         print(f"{'='*60}")
         
         reward, score = render_episode(
             checkpoint_path=CHECKPOINT,
-            output_dir=str(ep_output_dir),
+            output_dir=str(temp_dir),
             d_model=D_MODEL,
             lstm_hidden=LSTM_HIDDEN,
             deterministic=DETERMINISTIC,
             render_live=RENDER_LIVE,
         )
         results.append({'reward': reward, 'score': score})
-    
-    if NUM_EPISODES > 1:
-        wins = sum(1 for r in results if r['score'][0] > r['score'][1])
-        draws = sum(1 for r in results if r['score'][0] == r['score'][1])
-        losses = sum(1 for r in results if r['score'][0] < r['score'][1])
-        avg_reward = np.mean([r['reward'] for r in results])
         
-        print(f"\n{'='*60}")
-        print(f"Summary ({NUM_EPISODES} episodes)")
-        print(f"{'='*60}")
-        print(f"  Wins: {wins}, Draws: {draws}, Losses: {losses}")
-        print(f"  Win rate: {wins/NUM_EPISODES*100:.1f}%")
-        print(f"  Average reward: {avg_reward:.2f}")
+        if reward >= MIN_REWARD:
+            for f in temp_dir.glob("*.dump"):
+                shutil.move(str(f), output_dir / f.name)
+            for f in temp_dir.glob("*.avi"):
+                shutil.move(str(f), output_dir / f.name)
+            kept += 1
+            print(f"  -> KEPT ({kept}/{TARGET_VIDEOS})")
+        else:
+            print(f"  -> DISCARDED (reward {reward} < {MIN_REWARD})")
+    
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    
+    # Summary
+    wins = sum(1 for r in results if r['score'][0] > r['score'][1])
+    draws = sum(1 for r in results if r['score'][0] == r['score'][1])
+    losses = sum(1 for r in results if r['score'][0] < r['score'][1])
+    avg_reward = np.mean([r['reward'] for r in results])
+    
+    print(f"\n{'='*60}")
+    print(f"DONE! Collected {TARGET_VIDEOS} videos")
+    print(f"{'='*60}")
+    print(f"  Total episodes: {episode}")
+    print(f"  Keep rate: {kept/episode*100:.1f}%")
+    print(f"  Wins: {wins}, Draws: {draws}, Losses: {losses}")
+    print(f"  Average reward: {avg_reward:.2f}")
