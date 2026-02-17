@@ -1,246 +1,197 @@
-# RLlib GFootball – Progressive Self-Play mit Mamba-Hybrid-Netz
+# GFootball IMPALA League — Self-Play mit TrueSkill-Matchmaking
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red)](https://pytorch.org/)
-[![Ray RLlib](https://img.shields.io/badge/Ray-RLlib-5b5ce2)](https://docs.ray.io/en/latest/rllib/index.html)
 [![Google Research Football](https://img.shields.io/badge/Env-GFootball-0a9d57)](https://github.com/google-research/football)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
-> **Kurzfassung:** Dieses Repo trainiert Google Research Football Agents mit RLlib/IMPALA, einem **Mamba+Attention Hybrid-Netz**, **Trueskill-basiertem Self-Play**, **Champion-Tracking** und **Auto-Pruning** der Policy-Historie. Zusätzlich gibt’s einen **Video-Recorder**, der Episoden in „pixels“ rendert – perfekt für Demos und Präsentationen. ⚽️🧠
+> Trainiert einen 11v11 Google Research Football Agent mit **IMPALA + V-trace**,
+> **TrueSkill-basiertem League-Play**, **Self-Imitation Learning** und
+> **Behavioral Cloning Warmstart** — komplett von Grund auf bis zum Sieg gegen den Hard-Bot.
 
 ---
 
-## ✨ Features
+## Demo
 
-- **Progressives Curriculum** über mehrere Stages (von *Empty Goal* bis *11v11 stochastic*).
-- **Self-Play Engine** mit:
-  - Trueskill-Ratings (1v1), konservativer Skill (μ−3σ)
-  - **Champion-Tracking** & **geschützte Versionen**
-  - **Aktive Zone** + **Top-N** + **Auto-Pruning** alter Gewichte
-  - **Gegner-Sampling** nach Match-Quality (+Champion-Bias, Exploration)
-- **Population Based Training (PBT)** für Hyperparameter (LR, Entropy, VF-Loss).
-- **Mamba-Hybrid-Modell** (Mamba-Blöcke + Multi-Head Attention) und **Lite-Variante**.
-- **Multi-Agent-Wrapper** für GFootball (Links/Rechts-Teams, flexible Spieleranzahl).
-- **Video-Demos**: Trained vs. Random-Policy, direkt als MP4/Full Dumps.
+[![GFootball Agent Demo](https://img.youtube.com/vi/_oVHxy5FDkQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=_oVHxy5FDkQ)
+
+> Klick auf das Bild um das Video auf YouTube anzusehen.
 
 ---
 
-## 📦 Projektstruktur
+## Features
 
-```
-.
-├─ train.py                 # Hauptskript: Curriculum, Self-Play, PBT, PolicyPool
-├─ model.py                 # GFootballMambaHybrid2025 & GFootballMambaLite2025
-├─ demo_record.py           # DualEnvironmentRecorder + Video-Demos
-├─ requirements.txt         # (Empfohlen) – siehe Installation
-└─ README.md                # Diese Datei
-```
-
-> Falls deine Dateinamen abweichen: einfach oben anpassen. Die Klasse-/Funktionsnamen sind identisch.
+- **IMPALA mit V-trace** Off-Policy-Korrektur und Mixed-Precision Training
+- **TrueSkill League** mit automatischem Matchmaking (Champion-, Skill-Matched- und Exploration-Selektion)
+- **Self-Imitation Learning (SIL)** aus Golden Memory der besten Episoden
+- **Behavioral Cloning Warmstart** aus Expert-Demonstrationen (Parquet)
+- **PopArt Value Normalization** fuer stabile Wertschaetzungen bei nicht-stationaeren Targets
+- **Automatisches Snapshotting** bei Rating-Gewinn oder Champion-Siege
+- **Verteiltes Rollout-Sammeln** ueber Ray mit 32+ parallelen Workern
 
 ---
 
-## 🚀 Installation
+## Projektstruktur
 
-> **Voraussetzungen:** Python 3.10+, CUDA optional, FFmpeg (für Video-Export empfohlen)
-
-**1) Umgebung anlegen**
-```bash
-conda create -n gfootball-rllib python=3.10 -y
-conda activate gfootball-rllib
 ```
-
-**2) Abhängigkeiten**
-```bash
-# PyTorch (wähle passende CUDA-Variante unter https://pytorch.org/get-started/locally/)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# Ray & RLlib + Extras
-pip install "ray[default]" "ray[rllib]" "ray[tune]" "ray[air]"
-
-# Google Research Football
-pip install gfootball  # nutzt vorgebaute wheels; bei Problemen siehe GFootball-Doku
-
-# Sonstiges
-pip install gymnasium numpy trueskill dataclasses-json
-```
-
-> **Windows-Hinweis:** Wenn GFootball-Wheels zicken, nutze WSL2/Ubuntu oder Docker; alternativ vorgebaute Wheels aus Community-Repos.
-
----
-
-## 🏁 Schnellstart
-
-### 1) Training progressiv starten
-
-In `main()` werden Standard-Umgebungsvariablen gelesen:
-
-- `GFOOTBALL_DEBUG=true|false` – Render/Video, kurze Rollouts, lokaler Modus
-- `GFOOTBALL_TRANSFER=true|false` – Transfer über Stages
-- `GFOOTBALL_END_STAGE` – Letzte Stage (Index)
-
-**Beispiel (Linux/macOS):**
-```bash
-export GFOOTBALL_DEBUG=false
-export GFOOTBALL_TRANSFER=true
-# optional: export GFOOTBALL_END_STAGE=4
-python train.py
-```
-
-**Beispiel (Windows PowerShell):**
-```powershell
-$env:GFOOTBALL_DEBUG="false"
-$env:GFOOTBALL_TRANSFER="true"
-# optional: $env:GFOOTBALL_END_STAGE="4"
-python .	rain.py
-```
-
-> In `main()` ist ein **Beispiel-Checkpoint** hinterlegt (`initial_checkpoint`). Passe den Pfad an oder setze ihn auf `None`, um von Scratch zu starten.
-
-### 2) TensorBoard
-
-Nach jedem Stage-Run wird ein TensorBoard-Kommando in `training_results_transfer_pbt/tensorboard_commands.txt` ergänzt:
-```bash
-tensorboard --logdir "training_results_transfer_pbt/<experiment>"
+main/
+├── feature_engineer.py   # 93-dim Feature-Extraktion aus 115-dim Observationen
+├── net.py                # Encoder-LSTM-Policy/Value Netz mit PopArt
+├── bc_train.py           # Behavioral Cloning Trainer (Warmstart)
+├── league_learner.py     # IMPALA League Training Orchestrator
+└── expert.parquet        # Expert-Demonstrationen
 ```
 
 ---
 
-## 📚 Trainings-Curriculum
+## Architektur
 
-| Stage | Name                   | Env                                | Left | Right | Target R | Max Steps    | Beschreibung                  |
-|:-----:|------------------------|------------------------------------|:----:|:-----:|:--------:|-------------:|------------------------------|
-| 1     | stage_1_basic_0        | `academy_empty_goal_close`         | 1    | 0     | 0.75     | 10,000,000   | 1 Spieler vor Tor            |
-| 2     | stage_1_basic_1        | `academy_run_to_score_with_keeper` | 1    | 0     | 0.75     | 10,000,000   | 1 Spieler rennt zum Tor      |
-| 3     | stage_1_basic          | `academy_pass_and_shoot_with_keeper` | 1  | 0     | 0.75     | 10,000,000   | 1 Spieler gegen Keeper       |
-| 4     | stage_2_1v1            | `academy_3_vs_1_with_keeper`       | 3    | 0     | 0.75     | 20,000,000   | 1v1 (3 vs 1 Setup)           |
-| 5     | stage_3_3v3            | `11_vs_11_easy_stochastic`         | 3    | 0     | 1.0      | 50,000,000   | 3v3 (easy)                   |
-| 6     | stage_4_3v3            | `11_vs_11_easy_stochastic`         | 3    | 3     | 1.0      | 100,000,000  | 3v3 (easy, beide Seiten)     |
-| 7     | stage_5_3v3            | `11_vs_11_stochastic`              | 3    | 3     | 1.0      | 500,000,000  | 3v3 (stochastic, schwerer)   |
+### Netzwerk (`net.py`)
 
-> **Hinweis:** Die Stop-Kriterien nutzen `timesteps_total`. Das `target_reward` ist als Orientierung gedacht und wird (je nach Bedarf) nicht hart erzwungen.
-
----
-
-## 🧠 Architektur
-
-### Mamba-Hybrid-Netz
-- **MambaBlock:** depthwise Conv-Vorverarbeitung → vereinfachte SSM-Dynamik (A/B mean pooling) → Gate → Output-Proj.
-- **MultiHeadSpatialAttention** (optional in jedem zweiten Block)
-- **Feed-Forward (Mish)** + Residuals/LayerNorm
-- **Head-Design:** getrennte Policy/Value-Heads, orthogonale Init (NormC)
-
-### IMPALA + RLlib
-- **Framework:** PyTorch AMP (optional), Grad-Clip, große `train_batch_size`
-- **PBT:** Perturbation alle 64k Steps, Mutationen auf LR/Entropy/VF-Coeff
-- **Multi-Agent:** Left/Right Policies, dynamische `policies_to_train`
-
----
-
-## 🥊 Self-Play & PolicyPool
-
-- **Versioning:** Neue Versionen werden periodisch gespeichert (`version_save_interval`).
-- **Trueskill-Update:** Aggregiert Episoden-Scores; Sieg/Unentschieden/Niederlage → `rate_1vs1`.
-- **Champion-Schutz:** Beste konservative Skill-Version wird nie gepruned.
-- **Active Set:** `keep_top_n` (nach Skill), jüngste `active_zone_size`, aktuelle Version.
-- **Auto-Pruning:** Löscht Gewichte & Ratings alter Versionen (außer Schutz/Active).
-
-Konfigurierbar in `EnhancedSelfPlayCallback(...)` sowie `PolicyPool(...)`.
-
----
-
-## 🎬 Video-Demos
-
-`demo_record.py` rendert Episoden in „pixels“ parallel zur Trainingsumgebung („simple115v2“).  
-Du kannst **trainierte Checkpoints** oder **Random-Policies** aufnehmen.
-
-**Beispiel:**
-```python
-USE_RANDOM_WEIGHTS = False
-CHECKPOINT_PFAD = r"C:\clones\rlib_gfootball\training_results_transfer_pbt\stage_1_basic_1_20251019_191114\9e3b0_00000\checkpoint_000095"
-STAGE_KEY = "s3_pass_shoot"   # siehe DEMO_STAGES
-NUM_EPISODEN = 5
-
-create_video_demo(CHECKPOINT_PFAD, STAGE_KEY, NUM_EPISODEN)
+```
+[obs(115) | feat(93) | action_emb(16)] → 2-Layer MLP → LSTM → Policy + PopArt Value
 ```
 
-Ausgabe landet unter `presentation_demo_<stage>_trained_<timestamp>/videos/`.
+- **Encoder:** 2-schichtiges MLP mit LayerNorm + ReLU
+- **Sequenzmodell:** LSTM (512 hidden) fuer temporale Abhaengigkeiten
+- **Policy Head:** Linear → ReLU → Linear (19 Actions)
+- **Value Head:** PopArt-normalisiert mit adaptiver Gewichtskorrektur
+- **Init:** Orthogonale Initialisierung (gain=sqrt(2), Policy gain=0.01)
+
+### Feature Engineering (`feature_engineer.py`)
+
+93 handgefertigte Features aus der `simple115v2` Repraesentation:
+
+| Feature-Gruppe         | Dim  | Beschreibung                              |
+|------------------------|:----:|-------------------------------------------|
+| Ball-Zustand           | 7    | Position, Hoehe, Speed, Richtung, Besitz  |
+| Relative Ball-Position | 4    | Distanz und Winkel zum aktiven Spieler     |
+| Tor-Geometrie          | 5    | Distanz, Winkel, Schusszone, Eigentor      |
+| Keeper-Tracking        | 2    | Distanz und Winkel zum gegnerischen Keeper |
+| 5 naechste Mitspieler  | 20   | Relative Position + Richtung               |
+| 5 naechste Gegner      | 20   | Relative Position + Richtung               |
+| Formation              | 3    | Spieler vor/hinter Ball, Balance           |
+| Abseits                | 2    | Abseitslinie, Abseits-Flag                 |
+| Zonen                  | 5    | Angriff/Mittelfeld/Verteidigung, Lateral   |
+| Sticky Actions         | 11   | Sprint, Dribble, Richtungsvektor           |
+| Game Mode              | 7    | One-hot Spielmodus                         |
+| Reserviert             | 8    | Nullen (Erweiterbarkeit)                   |
+
+### League System (`league_learner.py`)
+
+```
+                    ┌─────────────┐
+                    │  Champion   │ ← 50% Selektion
+                    └──────┬──────┘
+                           │
+    ┌──────────────────────┼──────────────────────┐
+    │                      │                      │
+┌───▼───┐           ┌─────▼─────┐          ┌─────▼─────┐
+│ Bots  │           │ Snapshots │          │ Agent     │
+│ E/M/H │           │ (Top-15)  │          │ (Learner) │
+└───────┘           └───────────┘          └───────────┘
+  random              skill_matched           V-trace
+  lazy                35% Selektion           + SIL
+  easy/med/hard       15% exploration         + Expert BC
+```
+
+**Gegner-Pool:**
+- **Built-in Bots:** random, lazy, easy, medium, hard (feste TrueSkill-Ratings)
+- **Snapshots:** Vergangene Agent-Versionen (max 15, automatisch gepruned)
+- **Selektion:** 50% Champion, 35% Skill-Matched, 15% Exploration
 
 ---
 
-## ⚙️ Nützliche Umgebungsvariablen
+## Installation
 
 ```bash
-# Debug/Render kurz halten, lokaler Modus, 0 Runner
-export GFOOTBALL_DEBUG=true
+# Umgebung
+conda create -n gfootball python=3.10 -y
+conda activate gfootball
 
-# Transfer Learning über die Curriculum-Stages
-export GFOOTBALL_TRANSFER=true
+# PyTorch (CUDA-Version anpassen)
+pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-# Optional: letzte Stage als Index (0-basiert)
-export GFOOTBALL_END_STAGE=4
+# Dependencies
+pip install gfootball ray numpy trueskill pyarrow
 ```
 
 ---
 
-## 🧪 Troubleshooting
+## Schnellstart
 
-- **GFootball hängt/kein Render:** Stelle sicher, dass FFmpeg installiert ist; ggf. `write_video=False` setzen.
-- **Windows Pfade:** Backslashes escapen oder `r"raw\strings"` nutzen (siehe Beispiele).
-- **CUDA/AMP Fehler:** Setze `use_amp=False` im `custom_model_config`.
-- **„Cant call step() once episode finished“ beim Video:** Wird intern abgefangen; tritt bei sehr kurzen Episoden auf.
-- **Speicherverbrauch hoch:** `train_batch_size` reduzieren, `num_env_runners`/`num_envs_per_env_runner` anpassen.
+### 1) Behavioral Cloning Warmstart
 
----
-
-## 📈 Konfiguration anpassen (Beispiel)
-
-```python
-config = ImpalaConfig()   .environment("gfootball_multi", env_config={
-      "env_name": "11_vs_11_easy_stochastic",
-      "representation": "simple115v2",
-      "number_of_left_players_agent_controls": 3,
-      "number_of_right_players_agent_controls": 3,
-      "rewards": "scoring,checkpoints",
-      "stacked": True,
-  })   .framework("torch")   .env_runners(num_env_runners=5, num_envs_per_env_runner=1)   .training(
-      lr=1e-4, entropy_coeff=0.008, vf_loss_coeff=0.5,
-      grad_clip=0.5, train_batch_size=4096,
-      model={
-        "custom_model": "mamba_hybrid_2025",
-        "custom_model_config": {
-          "d_model": 256, "num_layers": 4, "d_state": 16,
-          "num_heads": 4, "use_attention": True,
-          "dropout": 0.1, "use_amp": True
-        }
-      },
-  )
+```bash
+cd main
+python bc_train.py expert.parquet bc_warmstart.pt
 ```
 
+Trainiert ein Policy-Netz supervised auf Expert-Daten (20 Epochen, ~45% Val-Accuracy).
+
+### 2) League Training
+
+```bash
+python league_learner.py
+```
+
+Startet das volle League-Training mit:
+- 32 Ray-Workern fuer paralleles Rollout-Sammeln
+- V-trace IMPALA Updates alle 128 Rollouts
+- SIL aus Golden Memory + Expert Buffer
+- Automatisches Snapshotting bei Rating-Gewinn
+
+### Konfiguration
+
+Die Hyperparameter sind direkt im `__main__`-Block von `league_learner.py` einstellbar:
+
+| Parameter          | Default | Beschreibung                           |
+|--------------------|:-------:|----------------------------------------|
+| `num_workers`      | 32      | Anzahl Ray Rollout-Worker              |
+| `rollout_len`      | 512     | Steps pro Rollout                      |
+| `batch_size`       | 128     | Rollouts pro Update                    |
+| `lr`               | 5e-4    | Lernrate (Adam)                        |
+| `d_model`          | 512     | Encoder Hidden-Dimension               |
+| `lstm_hidden`      | 512     | LSTM Hidden-Dimension                  |
+| `gamma`            | 0.997   | Discount-Faktor                        |
+| `entropy_coeff`    | 0.01    | Entropie-Bonus                         |
+| `max_snapshots`    | 15      | Max League-Snapshots                   |
+| `expert_threshold` | 0.7     | Win-Rate vs Hard-Bot zum Expert-Abschalten |
+
 ---
 
-## 🤝 Danksagung
+## Trainings-Verlauf
 
-- [Google Research Football](https://github.com/google-research/football)
-- [Ray RLlib](https://docs.ray.io/en/latest/rllib/index.html)
-- Arbeiten rund um **Mamba/SSM** als Inspiration für die Hybrid-Blöcke.
+Typischer Log-Output:
 
----
+```
+[  10] 0.7M 1k/s 8m | W: 78% R:+3.1(+11) | μ=41.8 σ=1.55 | E:50%(0) M:50%(0) H:62%(17)
+```
 
-## 📝 License
-
-Dieses Projekt steht unter der **MIT-Lizenz**. Siehe [LICENSE](LICENSE) für Details.
-
----
-
-## 📫 Kontakt
-
-Issues & PRs sind willkommen!  
-Wenn du Benchmarks, Logs oder Videos teilen magst: gerne verlinken 👇
-
-- TensorBoard: siehe `training_results_transfer_pbt/tensorboard_commands.txt`
-- Videos: Ordner `presentation_demo_*/videos/`
+| Feld       | Bedeutung                                        |
+|------------|--------------------------------------------------|
+| `[  10]`   | Update-Nummer                                    |
+| `0.7M`     | Gesamte Environment-Steps                        |
+| `W: 78%`   | Win-Rate (letzte 100 Spiele)                     |
+| `R:+3.1`   | Durchschnitts-Return                             |
+| `μ=41.8`   | TrueSkill Rating                                 |
+| `E/M/H`    | Win-Rate vs Easy/Medium/Hard Bot                 |
+| `VT`       | V-trace Loss-Metriken                            |
+| `EXP/SIL`  | Expert- und Self-Imitation-Metriken              |
+| `GM`       | Golden Memory Groesse (frische Eintraege)        |
 
 ---
 
-Viel Spaß beim Trainieren & Kicken! ⚽️🔥
+## Ergebnisse
+
+Der Agent erreicht nach ca. 100 Updates:
+- **100%** Win-Rate vs Easy Bot
+- **60%+** Win-Rate vs Medium Bot
+- **62%+** Win-Rate vs Hard Bot
+- **TrueSkill μ > 40** (konservativer Skill > 35)
+
+---
+
+## License
+
+MIT License. Siehe [LICENSE](LICENSE).
