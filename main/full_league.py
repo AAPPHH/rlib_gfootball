@@ -36,6 +36,7 @@ class LeagueMember:
     recent_draws: deque = field(default_factory=lambda: deque(maxlen=100))
     rating_history: deque = field(default_factory=lambda: deque(maxlen=500))
     rating_update_factor: float = 1.0
+    created_idx: int = 0
     @property
     def win_rate(self) -> float:
         return self.wins / max(1, self.games_played)
@@ -68,7 +69,7 @@ class LeagueMember:
         self.rating_history.append(self.rating.mu)
 
 class PureLeague:
-    def __init__(self, checkpoint_dir: Path, d_model: int = 512, lstm_hidden: int = 512, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, bot_floor: float = 0.25, min_skill_spacing: float = 3.0, min_policy_distance: float = 0.1):
+    def __init__(self, checkpoint_dir: Path, d_model: int = 512, lstm_hidden: int = 512, max_snapshots: int = 15, snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5, bot_floor: float = 0.25, latest_snapshot_prob: float = 0.5, min_skill_spacing: float = 3.0, min_policy_distance: float = 0.1):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.d_model, self.lstm_hidden = d_model, lstm_hidden
@@ -76,6 +77,8 @@ class PureLeague:
         self.snapshot_on_rating_gain = snapshot_on_rating_gain
         self.snapshot_on_champion_wins = snapshot_on_champion_wins
         self.bot_floor = bot_floor
+        self.latest_snapshot_prob = latest_snapshot_prob
+        self.snapshot_counter = 0
         self.min_skill_spacing = min_skill_spacing
         self.min_policy_distance = min_policy_distance
         self.members: Dict[str, LeagueMember] = {}
@@ -120,27 +123,33 @@ class PureLeague:
     def select_opponent(self, current_rating: trueskill.Rating, force_bot: str = None) -> Tuple[str, str]:
         if force_bot and force_bot in self.members:
             return force_bot, "eval"
-        if np.random.random() < self.bot_floor:
+        snapshots = [(n, m) for n, m in self.members.items() if m.member_type == "snapshot"]
+        r = np.random.random()
+        if r < self.bot_floor or not snapshots:
             bots = [n for n, m in self.members.items() if m.member_type == "bot"]
             weights = []
             for name in bots:
                 member = self.members[name]
                 if len(member.recent_wins) >= 5:
-                    weight = (1 - (1 - member.recent_win_rate - member.recent_draw_rate * 0.5)) ** 0.5
+                    agent_score = 1 - member.recent_win_rate - member.recent_draw_rate * 0.5
+                    weight = agent_score * (1 - agent_score) + 0.1
                 else:
                     weight = 0.5
-                weights.append(max(weight, 0.1))
+                weights.append(weight)
             return np.random.choice(bots, p=np.array(weights) / sum(weights)), "bot"
+        if r < self.bot_floor + self.latest_snapshot_prob:
+            newest = max(snapshots, key=lambda x: x[1].created_idx)
+            return newest[0], "latest"
         candidates, weights = list(self.members.keys()), []
         for name in candidates:
             member = self.members[name]
             win_prob = self.win_probability(current_rating, member.rating)
             if len(member.recent_wins) >= 5:
-                agent_wr = 1 - member.recent_win_rate - member.recent_draw_rate * 0.5
-                difficulty = (1 - win_prob) * 0.5 + (1 - agent_wr) * 0.5
+                agent_score = 1 - member.recent_win_rate - member.recent_draw_rate * 0.5
+                p = win_prob * 0.5 + agent_score * 0.5
             else:
-                difficulty = 0.5 + (1 - win_prob) * 0.3
-            weight = max(difficulty ** 0.5, 0.05)
+                p = win_prob
+            weight = p * (1 - p) + 0.05
             if member.games_played < 50:
                 weight *= 1.5
             weights.append(weight)
@@ -213,7 +222,7 @@ class PureLeague:
             if last_kept_skill - member.conservative_skill >= self.min_skill_spacing or name in keep:
                 keep.add(name)
                 last_kept_skill = member.conservative_skill
-        for name, _ in sorted(snapshots, key=lambda x: x[0], reverse=True)[:2]:
+        for name, _ in sorted(snapshots, key=lambda x: x[1].created_idx, reverse=True)[:2]:
             keep.add(name)
         removed = []
         for name, member in snapshots:
@@ -231,10 +240,12 @@ class PureLeague:
         self._maybe_prune_snapshots()
         self._ensure_skill_spacing()
         self.policy_fingerprints[name] = self.compute_policy_fingerprint(weights)
+        self.snapshot_counter += 1
         self.members[name] = LeagueMember(
             name=name, member_type="snapshot",
             rating=TS_ENV.create_rating(mu=rating.mu, sigma=rating.sigma),
-            weights_path=weights_path, rating_update_factor=1.0
+            weights_path=weights_path, rating_update_factor=1.0,
+            created_idx=self.snapshot_counter
         )
         self.last_snapshot_rating = rating.mu
         self.wins_vs_champion = 0
@@ -251,7 +262,7 @@ class PureLeague:
             keep.add(self.champion)
         for m in sorted(snapshots, key=lambda m: m.conservative_skill, reverse=True)[:5]:
             keep.add(m.name)
-        for m in sorted(snapshots, key=lambda m: m.name, reverse=True)[:3]:
+        for m in sorted(snapshots, key=lambda m: m.created_idx, reverse=True)[:3]:
             keep.add(m.name)
         for m in snapshots:
             if m.name not in keep:
@@ -307,7 +318,7 @@ class PureLeague:
             m = self.members[name]
             champ = "👑" if name == self.champion else "  "
             icon = "🤖" if mtype == "bot" else "📸"
-            print(f"{champ}{i:2d}. {icon} {name:25s} μ={m.rating.mu:5.1f} σ={m.rating.sigma:4.2f} skill={skill:5.1f} games={m.games_played:4d} agent_wr={(1 - m.recent_win_rate)*100:4.0f}%")
+            print(f"{champ}{i:2d}. {icon} {name:25s} μ={m.rating.mu:5.1f} σ={m.rating.sigma:4.2f} skill={skill:5.1f} games={m.games_played:4d} agent_wr={(1 - m.recent_win_rate - m.recent_draw_rate)*100:4.0f}%")
         print("="*70)
 
     def save(self, path: Path = None):
@@ -318,10 +329,11 @@ class PureLeague:
                 'weights_path': m.weights_path, 'games_played': m.games_played, 'wins': m.wins, 'losses': m.losses,
                 'draws': m.draws, 'env_name': m.env_name, 'controls_right': m.controls_right,
                 'rating_update_factor': m.rating_update_factor, 'recent_wins': list(m.recent_wins),
-                'recent_draws': list(m.recent_draws)
+                'recent_draws': list(m.recent_draws), 'created_idx': m.created_idx
             } for name, m in self.members.items()},
             'champion': self.champion, 'last_snapshot_rating': self.last_snapshot_rating,
             'wins_vs_champion': self.wins_vs_champion, 'total_games': self.total_games,
+            'snapshot_counter': self.snapshot_counter,
             'policy_fingerprints': {k: v.tolist() for k, v in self.policy_fingerprints.items()}
         }
         with open(path, 'wb') as f:
@@ -341,7 +353,8 @@ class PureLeague:
                 weights_path=d.get('weights_path'), games_played=d.get('games_played', 0),
                 wins=d.get('wins', 0), losses=d.get('losses', 0), draws=d.get('draws', 0),
                 env_name=d.get('env_name'), controls_right=d.get('controls_right', False),
-                rating_update_factor=d.get('rating_update_factor', 1.0)
+                rating_update_factor=d.get('rating_update_factor', 1.0),
+                created_idx=d.get('created_idx', 0)
             )
             m.recent_wins = deque(d.get('recent_wins', []), maxlen=100)
             m.recent_draws = deque(d.get('recent_draws', []), maxlen=100)
@@ -350,6 +363,7 @@ class PureLeague:
         self.last_snapshot_rating = state.get('last_snapshot_rating', 25.0)
         self.wins_vs_champion = state.get('wins_vs_champion', 0)
         self.total_games = state.get('total_games', 0)
+        self.snapshot_counter = state.get('snapshot_counter', max((m.created_idx for m in self.members.values()), default=0))
         self.policy_fingerprints = {k: np.array(v) for k, v in state.get('policy_fingerprints', {}).items()}
         print(f"  📂 League loaded: {len(self.members)} members, champion={self.champion}")
         return True
@@ -550,10 +564,11 @@ def vtrace(behavior_lp, target_lp, rewards, values, bootstrap, dones, gamma=0.99
 
 @ray.remote(num_cpus=1)
 class SelfPlayWorker:
-    def __init__(self, wid: int, d_model: int, lstm_hidden: int, goal_traj_len: int = 128):
+    def __init__(self, wid: int, d_model: int, lstm_hidden: int, rollout_len: int = 512, goal_traj_len: int = 128):
         self.wid = wid
         self.d_model = d_model
         self.lstm_hidden = lstm_hidden
+        self.rollout_len = rollout_len
         self.goal_traj_len = goal_traj_len
         self.feat_eng = FeatureEngineer()
         self.model = Net(d_model, lstm_hidden)
@@ -566,6 +581,14 @@ class SelfPlayWorker:
         self.opp_feat = None
         self.opp_prev_act = None
         self.opp_hidden = None
+        self.obs = None
+        self.feat = None
+        self.prev_act = None
+        self.hidden = None
+        self.ep_ret = 0.0
+        self.ep_len = 0
+        self.ep_score = [0, 0]
+        self.rolling = {k: deque(maxlen=goal_traj_len) for k in ['obs', 'feat', 'prev_act', 'act', 'lp']}
 
     def set_weights(self, weights: dict):
         self.model.load_state_dict({k: torch.from_numpy(v.copy()) for k, v in weights.items()})
@@ -582,23 +605,24 @@ class SelfPlayWorker:
                 self.opp_prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
                 self.opp_hidden = None
 
-    def _create_env(self, env_name: str, left: int, right: int):
-        env_key = (env_name, left, right)
+    def _create_env(self, env_name: str, left: int, right: int, rewards: str = "scoring") -> bool:
+        env_key = (env_name, left, right, rewards)
         if self.current_env_key == env_key and self.env is not None:
-            return
+            return False
         if self.env is not None:
             self.env.close()
         self.env = football_env.create_environment(
             env_name=env_name, representation="simple115v2",
             number_of_left_players_agent_controls=left,
             number_of_right_players_agent_controls=right,
-            rewards="scoring", render=False
+            rewards=rewards, render=False
         )
         self.current_env_key = env_key
+        return True
 
     def _reset(self):
         raw_obs = self.env.reset()
-        _, left, right = self.current_env_key
+        _, left, right, _ = self.current_env_key
         if right > 0:
             if isinstance(raw_obs, list) and len(raw_obs) == 2:
                 left_obs = np.array(raw_obs[0]).flatten()[:OBS_DIM].astype(np.float32)
@@ -606,16 +630,21 @@ class SelfPlayWorker:
             else:
                 left_obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
                 right_obs = left_obs.copy()
-            obs, feat = left_obs, self.feat_eng.extract(left_obs)
+            self.obs, self.feat = left_obs, self.feat_eng.extract(left_obs)
             self.opp_obs = right_obs
             self.opp_feat = self.feat_eng.extract(right_obs)
             self.opp_prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
             if self.opponent_model is not None:
                 self.opp_hidden = self.opponent_model.init_hidden(1, torch.device('cpu'))
         else:
-            obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
-            feat = self.feat_eng.extract(obs)
-        return obs, feat
+            self.obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
+            self.feat = self.feat_eng.extract(self.obs)
+        self.prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
+        self.hidden = self.model.init_hidden(1, torch.device('cpu'))
+        self.ep_ret, self.ep_len = 0.0, 0
+        self.ep_score = [0, 0]
+        for buf in self.rolling.values():
+            buf.clear()
 
     def _get_opponent_action(self) -> Optional[int]:
         if self.opponent_type == "random":
@@ -633,107 +662,114 @@ class SelfPlayWorker:
             return act.item()
         return None
 
-    def collect(self, env_config: Tuple[str, int, int], opponent_type: str, opponent_weights: dict = None) -> dict:
+    def collect(self, env_config: Tuple[str, int, int], opponent_type: str, opponent_weights: dict = None, rewards: str = "scoring") -> dict:
         env_name, left, right = env_config
         self.set_opponent(opponent_type, opponent_weights)
-        self._create_env(env_name, left, right)
-        obs, feat = self._reset()
+        env_changed = self._create_env(env_name, left, right, rewards)
+        if env_changed or self.obs is None:
+            self._reset()
         is_selfplay = right > 0
         data = {k: [] for k in ['obs', 'feat', 'prev_act', 'act', 'lp', 'rew', 'done']}
-        rolling = {k: deque(maxlen=self.goal_traj_len) for k in ['obs', 'feat', 'prev_act', 'act', 'lp']}
+        episodes = []
         goal_trajectories = []
-        prev_act = torch.tensor([NUM_ACTIONS], dtype=torch.long)
-        hidden = self.model.init_hidden(1, torch.device('cpu'))
-        ep_ret, ep_len = 0.0, 0
-        ep_score = [0, 0]
-        while True:
+        for _ in range(self.rollout_len):
             with torch.no_grad():
-                act, lp, _, hidden = self.model.get_action(
-                    torch.from_numpy(obs).float().unsqueeze(0),
-                    torch.from_numpy(feat).float().unsqueeze(0),
-                    prev_act, hidden
+                act, lp, _, self.hidden = self.model.get_action(
+                    torch.from_numpy(self.obs).float().unsqueeze(0),
+                    torch.from_numpy(self.feat).float().unsqueeze(0),
+                    self.prev_act, self.hidden
                 )
-            data['obs'].append(obs.copy())
-            data['feat'].append(feat.copy())
-            data['prev_act'].append(prev_act.item())
+            data['obs'].append(self.obs.copy())
+            data['feat'].append(self.feat.copy())
+            data['prev_act'].append(self.prev_act.item())
             data['act'].append(act.item())
             data['lp'].append(lp.item())
-            rolling['obs'].append(obs.copy())
-            rolling['feat'].append(feat.copy())
-            rolling['prev_act'].append(prev_act.item())
-            rolling['act'].append(act.item())
-            rolling['lp'].append(lp.item())
-            prev_act = act.clone()
+            self.rolling['obs'].append(self.obs.copy())
+            self.rolling['feat'].append(self.feat.copy())
+            self.rolling['prev_act'].append(self.prev_act.item())
+            self.rolling['act'].append(act.item())
+            self.rolling['lp'].append(lp.item())
+            self.prev_act = act.clone()
             env_action = [act.item(), self._get_opponent_action()] if is_selfplay else [act.item()]
             raw_obs, rew, done, info = self.env.step(env_action)
             rew = float(rew[0]) if isinstance(rew, (list, np.ndarray)) else float(rew)
             done = done[0] if isinstance(done, (list, np.ndarray)) else done
-            ep_ret += rew
-            ep_len += 1
+            self.ep_ret += rew
+            self.ep_len += 1
             if rew > 0.5:
-                ep_score[0] += 1
-                if len(rolling['obs']) >= self.goal_traj_len // 4:
-                    traj_len = len(rolling['obs'])
+                self.ep_score[0] += 1
+                if len(self.rolling['obs']) >= self.goal_traj_len // 4:
+                    traj_len = len(self.rolling['obs'])
                     traj_rew = np.zeros(traj_len, dtype=np.float32)
                     traj_done = np.zeros(traj_len, dtype=np.float32)
                     traj_rew[-1] = 1.0
                     traj_done[-1] = 1.0
                     goal_trajectories.append({
-                        'obs': np.array(list(rolling['obs']), dtype=np.float32),
-                        'feat': np.array(list(rolling['feat']), dtype=np.float32),
-                        'prev_act': np.array(list(rolling['prev_act']), dtype=np.int64),
-                        'act': np.array(list(rolling['act']), dtype=np.int64),
-                        'lp': np.array(list(rolling['lp']), dtype=np.float32),
+                        'obs': np.array(list(self.rolling['obs']), dtype=np.float32),
+                        'feat': np.array(list(self.rolling['feat']), dtype=np.float32),
+                        'prev_act': np.array(list(self.rolling['prev_act']), dtype=np.int64),
+                        'act': np.array(list(self.rolling['act']), dtype=np.int64),
+                        'lp': np.array(list(self.rolling['lp']), dtype=np.float32),
                         'rew': traj_rew, 'done': traj_done, 'bootstrap': 0.0
                     })
-                for buf in rolling.values():
+                for buf in self.rolling.values():
                     buf.clear()
             elif rew < -0.5:
-                ep_score[1] += 1
-                for buf in rolling.values():
+                self.ep_score[1] += 1
+                for buf in self.rolling.values():
                     buf.clear()
             data['rew'].append(rew)
             data['done'].append(float(bool(done)))
             if bool(done):
-                return {
-                    'obs': np.array(data['obs'], dtype=np.float32),
-                    'feat': np.array(data['feat'], dtype=np.float32),
-                    'prev_act': np.array(data['prev_act'], dtype=np.int64),
-                    'act': np.array(data['act'], dtype=np.int64),
-                    'lp': np.array(data['lp'], dtype=np.float32),
-                    'rew': np.array(data['rew'], dtype=np.float32),
-                    'done': np.array(data['done'], dtype=np.float32),
-                    'bootstrap': 0.0,
-                    'episode': {
-                        'return': ep_ret, 'won': ep_score[0] > ep_score[1],
-                        'drawn': ep_score[0] == ep_score[1], 'length': ep_len,
-                        'opponent': opponent_type, 'goals_scored': ep_score[0]
-                    },
-                    'opponent_type': opponent_type,
-                    'goal_trajectories': goal_trajectories
-                }
-            if is_selfplay:
+                episodes.append({
+                    'return': self.ep_ret, 'won': self.ep_score[0] > self.ep_score[1],
+                    'drawn': self.ep_score[0] == self.ep_score[1], 'length': self.ep_len,
+                    'opponent': opponent_type, 'goals_scored': self.ep_score[0]
+                })
+                self._reset()
+            elif is_selfplay:
                 if isinstance(raw_obs, list) and len(raw_obs) == 2:
-                    obs = np.array(raw_obs[0]).flatten()[:OBS_DIM].astype(np.float32)
+                    self.obs = np.array(raw_obs[0]).flatten()[:OBS_DIM].astype(np.float32)
                     self.opp_obs = np.array(raw_obs[1]).flatten()[:OBS_DIM].astype(np.float32)
                 else:
-                    obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
-                    self.opp_obs = obs.copy()
-                feat = self.feat_eng.extract(obs)
+                    self.obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
+                    self.opp_obs = self.obs.copy()
+                self.feat = self.feat_eng.extract(self.obs)
                 self.opp_feat = self.feat_eng.extract(self.opp_obs)
             else:
-                obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
-                feat = self.feat_eng.extract(obs)
+                self.obs = np.array(raw_obs).flatten()[:OBS_DIM].astype(np.float32)
+                self.feat = self.feat_eng.extract(self.obs)
+        with torch.no_grad():
+            _, _, bootstrap, _ = self.model.get_action(
+                torch.from_numpy(self.obs).float().unsqueeze(0),
+                torch.from_numpy(self.feat).float().unsqueeze(0),
+                self.prev_act, self.hidden
+            )
+        return {
+            'obs': np.array(data['obs'], dtype=np.float32),
+            'feat': np.array(data['feat'], dtype=np.float32),
+            'prev_act': np.array(data['prev_act'], dtype=np.int64),
+            'act': np.array(data['act'], dtype=np.int64),
+            'lp': np.array(data['lp'], dtype=np.float32),
+            'rew': np.array(data['rew'], dtype=np.float32),
+            'done': np.array(data['done'], dtype=np.float32),
+            'bootstrap': bootstrap.item(),
+            'episodes': episodes,
+            'opponent_type': opponent_type,
+            'goal_trajectories': goal_trajectories
+        }
 
     def close(self):
         if self.env is not None:
             self.env.close()
 
 class ExpertBufferGPU:
-    def __init__(self, parquet_path: str, device: torch.device):
+    def __init__(self, parquet_path: str, device: torch.device, window_len: int = 512):
         self.device = device
+        self.window_len = window_len
         self.num_episodes = 0
         self.episode_slices = []
+        self.window_slices = []
         self.obs = self.feat = self.act = self.rew = self.done = self.prev_act = None
         if parquet_path and Path(parquet_path).exists():
             self._load_parquet(parquet_path)
@@ -776,15 +812,20 @@ class ExpertBufferGPU:
         self.done = torch.from_numpy(np.concatenate(all_done)).float().to(self.device)
         self.prev_act = torch.from_numpy(np.concatenate(all_prev_act)).long().to(self.device)
         self.num_episodes = len(unique_eps)
+        for start, end in self.episode_slices:
+            s = start
+            while s < end:
+                self.window_slices.append((s, min(s + self.window_len, end)))
+                s += self.window_len
         vram_mb = (self.obs.numel()*4 + self.feat.numel()*4 + self.act.numel()*8 + self.rew.numel()*4 + self.done.numel()*4 + self.prev_act.numel()*8) / 1e6
-        print(f"Expert Buffer on GPU: {self.num_episodes} episodes, {len(self.obs)} steps, {vram_mb:.1f}MB VRAM")
+        print(f"Expert Buffer on GPU: {self.num_episodes} episodes, {len(self.window_slices)} windows (<= {self.window_len} steps), {len(self.obs)} steps, {vram_mb:.1f}MB VRAM")
 
     def sample(self, n: int) -> dict:
-        if self.num_episodes == 0:
+        if not self.window_slices:
             return None
-        n = min(n, self.num_episodes)
-        idx = np.random.choice(self.num_episodes, size=n, replace=False)
-        max_len = max(self.episode_slices[i][1] - self.episode_slices[i][0] for i in idx)
+        n = min(n, len(self.window_slices))
+        idx = np.random.choice(len(self.window_slices), size=n, replace=False)
+        max_len = max(self.window_slices[i][1] - self.window_slices[i][0] for i in idx)
         obs = torch.zeros(n, max_len, OBS_DIM, device=self.device)
         feat = torch.zeros(n, max_len, FEATURE_DIM, device=self.device)
         act = torch.zeros(n, max_len, dtype=torch.long, device=self.device)
@@ -793,8 +834,8 @@ class ExpertBufferGPU:
         prev_act = torch.zeros(n, max_len, dtype=torch.long, device=self.device)
         mask = torch.zeros(n, max_len, device=self.device)
         lp = torch.zeros(n, max_len, device=self.device)
-        for i, ep_idx in enumerate(idx):
-            start, end = self.episode_slices[ep_idx]
+        for i, win_idx in enumerate(idx):
+            start, end = self.window_slices[win_idx]
             length = end - start
             obs[i, :length] = self.obs[start:end]
             feat[i, :length] = self.feat[start:end]
@@ -810,7 +851,7 @@ class ExpertBufferGPU:
         }
 
     def __len__(self):
-        return self.num_episodes
+        return len(self.window_slices)
 
 class GoldenMemoryGPU:
     def __init__(self, capacity: int, max_uses: int, traj_len: int, device: torch.device):
@@ -894,15 +935,17 @@ class GoldenMemoryGPU:
         return self.size
 
 class LeagueLearner:
-    def __init__(self, num_workers: int = 24, batch_size: int = 24, lr: float = 5e-4, gamma: float = 1.0,
+    def __init__(self, num_workers: int = 24, rollout_len: int = 512, batch_size: int = 24, lr: float = 5e-4, gamma: float = 1.0,
                  entropy_coeff: float = 0.01, value_coeff: float = 0.5, sil_coeff: float = 0.5,
                  d_model: int = 512, lstm_hidden: int = 512, checkpoint_dir: str = "./checkpoints_league",
                  warmstart_path: str = None, expert_parquet: str = None, max_snapshots: int = 15,
                  snapshot_on_rating_gain: float = 2.0, snapshot_on_champion_wins: int = 5,
-                 bot_floor: float = 0.25, expert_threshold: float = 0.7, min_skill_spacing: float = 3.0,
+                 bot_floor: float = 0.25, latest_snapshot_prob: float = 0.5, expert_threshold: float = 0.7,
+                 min_skill_spacing: float = 3.0,
                  min_policy_distance: float = 0.1, goal_traj_len: int = 128, golden_capacity: int = 2048,
                  golden_max_uses: int = 5):
         self.num_workers = num_workers
+        self.rollout_len = rollout_len
         self.batch_size = batch_size
         self.gamma = gamma
         self.entropy_coeff = entropy_coeff
@@ -923,13 +966,14 @@ class LeagueLearner:
             self.model.load_state_dict(ckpt['model'], strict=False)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=1e-5)
         self.scaler = GradScaler('cuda')
-        self.expert = ExpertBufferGPU(expert_parquet, self.device) if expert_parquet else None
+        self.expert = ExpertBufferGPU(expert_parquet, self.device, rollout_len) if expert_parquet else None
         self.golden = GoldenMemoryGPU(golden_capacity, golden_max_uses, goal_traj_len, self.device)
         self.current_rating = TS_ENV.create_rating(mu=25.0, sigma=8.333)
         self.league = PureLeague(
             checkpoint_dir=self.checkpoint_dir, d_model=d_model, lstm_hidden=lstm_hidden,
             max_snapshots=max_snapshots, snapshot_on_rating_gain=snapshot_on_rating_gain,
             snapshot_on_champion_wins=snapshot_on_champion_wins, bot_floor=bot_floor,
+            latest_snapshot_prob=latest_snapshot_prob,
             min_skill_spacing=min_skill_spacing, min_policy_distance=min_policy_distance
         )
         if (self.checkpoint_dir / "league.pkl").exists():
@@ -941,7 +985,7 @@ class LeagueLearner:
             if "warmstart" not in self.league.members:
                 self.league.add_snapshot("warmstart", str(snap_path), self._weights(), TS_ENV.create_rating(mu=25.0, sigma=8.0))
         ray.init(ignore_reinit_error=True, num_cpus=num_workers + 4)
-        self.workers = [SelfPlayWorker.remote(i, d_model, lstm_hidden, goal_traj_len) for i in range(num_workers)]
+        self.workers = [SelfPlayWorker.remote(i, d_model, lstm_hidden, rollout_len, goal_traj_len) for i in range(num_workers)]
         self.total_steps = 0
         self.total_matches = 0
         self.updates = 0
@@ -961,17 +1005,25 @@ class LeagueLearner:
     def _print_config(self, lr, golden_capacity, golden_max_uses):
         print(f"\n{'='*70}")
         print(f"IMPALA + PFSP League (GPU Buffers) | {self.device} | {self.num_workers}W")
-        print(f"Batch: {self.batch_size} matches | Goal Traj: {self.goal_traj_len} steps")
+        print(f"Batch: {self.batch_size} x {self.rollout_len} = {self.batch_size * self.rollout_len:,} samples/update | Goal Traj: {self.goal_traj_len} steps")
         print(f"Golden: capacity={golden_capacity} max_uses={golden_max_uses}")
         print(f"LR: {lr} | γ: {self.gamma} | Ent: {self.entropy_coeff} | Val: {self.value_coeff} | SIL: {self.sil_coeff}")
-        print(f"League: max_snap={self.league.max_snapshots} bot_floor={self.league.bot_floor:.0%} skill_spacing={self.league.min_skill_spacing} policy_dist={self.league.min_policy_distance}")
+        print(f"League: max_snap={self.league.max_snapshots} bot_floor={self.league.bot_floor:.0%} latest_snap={self.league.latest_snapshot_prob:.0%} skill_spacing={self.league.min_skill_spacing} policy_dist={self.league.min_policy_distance}")
         if self.expert:
-            print(f"Expert Buffer (GPU): {len(self.expert)} episodes | threshold: {self.expert_threshold}")
+            print(f"Expert Buffer (GPU): {len(self.expert)} windows | threshold: {self.expert_threshold}")
         print(f"Current Rating: μ={self.current_rating.mu:.1f}, σ={self.current_rating.sigma:.2f}")
         print(f"{'='*70}\n")
 
     def _weights(self) -> dict:
         return {k: v.cpu().numpy() for k, v in self.model.state_dict().items()}
+
+    def _dispatch(self, w):
+        self.eval_cycle += 1
+        force_bot = self.eval_bots[self.eval_cycle % 50] if self.eval_cycle % 50 < len(self.eval_bots) else None
+        opponent, _ = self.league.select_opponent(self.current_rating, force_bot=force_bot)
+        opp_weights = self.league.get_member_weights(opponent)
+        opp_type = "snapshot" if opp_weights else opponent
+        self.pending[w.collect.remote(self.league.get_env_config(opponent), opp_type, opp_weights)] = (w, opponent)
 
     def _prepare_batch(self, rollouts):
         max_len = max(r['obs'].shape[0] for r in rollouts)
@@ -1121,12 +1173,7 @@ class LeagueLearner:
         self.start = time.time()
         ray.get([w.set_weights.remote(self._weights()) for w in self.workers])
         for w in self.workers:
-            self.eval_cycle += 1
-            force_bot = self.eval_bots[self.eval_cycle % 50] if self.eval_cycle % 50 < len(self.eval_bots) else None
-            opponent, _ = self.league.select_opponent(self.current_rating, force_bot=force_bot)
-            opp_weights = self.league.get_member_weights(opponent)
-            opp_type = "snapshot" if opp_weights else opponent
-            self.pending[w.collect.remote(self.league.get_env_config(opponent), opp_type, opp_weights)] = (w, opponent)
+            self._dispatch(w)
         while time.time() - self.start < max_time:
             while len(self.queue) < self.batch_size:
                 done_refs, _ = ray.wait(list(self.pending.keys()), num_returns=1)
@@ -1135,35 +1182,30 @@ class LeagueLearner:
                     rollout = ray.get(ref)
                     self.queue.append(rollout)
                     self.total_steps += rollout['obs'].shape[0]
-                    self.total_matches += 1
-                    ep = rollout['episode']
-                    self.returns.append(ep['return'])
-                    self.lengths.append(ep['length'])
-                    if ep['won']:
-                        self.ep_wins.append(1)
-                        self.ep_draws.append(0)
-                        self.ep_losses.append(0)
-                    elif ep['drawn']:
-                        self.ep_wins.append(0)
-                        self.ep_draws.append(1)
-                        self.ep_losses.append(0)
-                    else:
-                        self.ep_wins.append(0)
-                        self.ep_draws.append(0)
-                        self.ep_losses.append(1)
-                    if opponent_name == "bot_hard":
-                        self.returns_vs_hard.append(ep['return'])
-                    self.current_rating = self.league.report_game(opponent_name, self.current_rating, won=ep['won'], drawn=ep['drawn'])
+                    for ep in rollout['episodes']:
+                        self.total_matches += 1
+                        self.returns.append(ep['return'])
+                        self.lengths.append(ep['length'])
+                        if ep['won']:
+                            self.ep_wins.append(1)
+                            self.ep_draws.append(0)
+                            self.ep_losses.append(0)
+                        elif ep['drawn']:
+                            self.ep_wins.append(0)
+                            self.ep_draws.append(1)
+                            self.ep_losses.append(0)
+                        else:
+                            self.ep_wins.append(0)
+                            self.ep_draws.append(0)
+                            self.ep_losses.append(1)
+                        if opponent_name == "bot_hard":
+                            self.returns_vs_hard.append(ep['return'])
+                        self.current_rating = self.league.report_game(opponent_name, self.current_rating, won=ep['won'], drawn=ep['drawn'])
                     opp_mu = self.league.members[opponent_name].rating.mu if opponent_name in self.league.members else 25.0
                     for traj in rollout.get('goal_trajectories', []):
                         self.golden.add(traj, opp_mu)
                     w.set_weights.remote(self._weights())
-                    self.eval_cycle += 1
-                    force_bot = self.eval_bots[self.eval_cycle % 50] if self.eval_cycle % 50 < len(self.eval_bots) else None
-                    opponent, _ = self.league.select_opponent(self.current_rating, force_bot=force_bot)
-                    opp_weights = self.league.get_member_weights(opponent)
-                    opp_type = "snapshot" if opp_weights else opponent
-                    self.pending[w.collect.remote(self.league.get_env_config(opponent), opp_type, opp_weights)] = (w, opponent)
+                    self._dispatch(w)
             batch = self.queue[:self.batch_size]
             self.queue = self.queue[self.batch_size:]
             stats = self._update(batch)
@@ -1218,14 +1260,14 @@ class LeagueLearner:
 
 if __name__ == "__main__":
     learner = LeagueLearner(
-        num_workers=28, batch_size=24, lr=0.0003, gamma=0.9997,
-        entropy_coeff=0.05, value_coeff=0.5, sil_coeff=0.5,
+        num_workers=28, rollout_len=512, batch_size=64, lr=0.0001, gamma=0.999,
+        entropy_coeff=0.01, value_coeff=0.2, sil_coeff=0.5,
         d_model=512, lstm_hidden=512,
-        checkpoint_dir="./checkpoints_league_v76",
-        warmstart_path=r"C:\clones\rlib_gfootball\bc_warmstart.pt",
+        checkpoint_dir="./checkpoints_league_v77",
+        warmstart_path=r"C:\clones\rlib_gfootball\bc_warmstart_v2.pt",
         expert_parquet=r"C:\clones\rlib_gfootball\main\expert.parquet",
         max_snapshots=15, snapshot_on_rating_gain=2.0, snapshot_on_champion_wins=5,
-        bot_floor=1.0, expert_threshold=0.7,
+        bot_floor=0.25, latest_snapshot_prob=0.5, expert_threshold=0.7,
         min_skill_spacing=3.0, min_policy_distance=0.02,
         goal_traj_len=128, golden_capacity=2048, golden_max_uses=5,
     )
